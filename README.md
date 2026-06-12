@@ -30,6 +30,7 @@ copy ..\config\xianyu_item_urls.example.txt ..\config\xianyu_item_urls.txt
 ```
 
 4. Edit the local config files with your own keywords or public item URLs.
+5. Optional: copy `config/xianyu_local_defaults.example.json` to `config/xianyu_local_defaults.json` to set private local defaults for new keywords.
 
 ## Usage
 

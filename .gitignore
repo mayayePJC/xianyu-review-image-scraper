@@ -9,6 +9,7 @@ browser_profile/
 config/xianyu_keywords.txt
 config/xianyu_item_urls.txt
 config/ocr_uid_calibration.local.json
+config/xianyu_local_defaults.json
 
 # Internal runtime artifacts
 _internal/node_modules/

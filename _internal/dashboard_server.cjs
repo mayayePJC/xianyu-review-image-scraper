@@ -15,11 +15,22 @@ const KEYWORD_STATE_FILE = path.join(DATA_DIR, 'keyword_state.csv');
 const LINK_STATE_FILE = path.join(DATA_DIR, 'link_state.csv');
 const IMAGE_STATE_FILE = path.join(DATA_DIR, 'image_state.csv');
 const KEYWORD_CONFIG_FILE = path.join(ROOT_DIR, 'config', 'xianyu_keywords.txt');
+const LOCAL_DEFAULTS_FILE = path.join(ROOT_DIR, 'config', 'xianyu_local_defaults.json');
 const KEYWORD_HEADERS = ['keyword', 'keyword_type', 'game_name', 'created_at', 'updated_at', 'notes'];
 const LINK_HEADERS = ['link_id', 'keyword', 'item_url', 'seller_url', 'review_url', 'seller_name', 'item_title', 'card_text', 'has_images', 'total_images', 'images_downloaded', 'images_remaining', 'link_status', 'image_status', 'last_link_crawl_at', 'last_image_crawl_at', 'notes'];
 const IMAGE_HEADERS = ['image_id', 'seller_id', 'link_id', 'keyword', 'seller_url', 'review_url', 'thumb_url', 'original_url', 'local_path', 'source', 'width', 'height', 'content_type', 'bytes', 'sha256', 'status', 'downloaded_at', 'notes', 'uid', 'usable'];
-const DEFAULT_KEYWORD_TYPE = 'general';
-const DEFAULT_GAME_NAME = 'default';
+function loadLocalDefaults() {
+  try {
+    const raw = fsSync.readFileSync(LOCAL_DEFAULTS_FILE, 'utf8');
+    const parsed = JSON.parse(raw.replace(/^\uFEFF/, ''));
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+const LOCAL_DEFAULTS = loadLocalDefaults();
+const DEFAULT_KEYWORD_TYPE = String(LOCAL_DEFAULTS.keyword_type || LOCAL_DEFAULTS.keywordType || 'general').trim() || 'general';
+const DEFAULT_GAME_NAME = String(LOCAL_DEFAULTS.game_name || LOCAL_DEFAULTS.gameName || 'default').trim() || 'default';
 const PORT = Number(process.env.XIANYU_DASHBOARD_PORT || 8787);
 const NODE_EXE = process.execPath;
 const BUNDLED_PYTHON_EXE = path.join(

@@ -2,6 +2,7 @@
 'use strict';
 
 const fs = require('fs/promises');
+const fsSync = require('fs');
 const path = require('path');
 
 const ROOT_DIR = path.basename(__dirname).toLowerCase() === '_internal' ? path.resolve(__dirname, '..') : __dirname;
@@ -13,8 +14,19 @@ const IMAGE_STATE_FILE = path.join(DATA_DIR, 'image_state.csv');
 const KEYWORD_STATE_FILE = path.join(DATA_DIR, 'keyword_state.csv');
 const IMAGE_UID_EXPORT_FILE = path.join(SITE_DIR, 'image_uid_export.csv');
 const KEYWORD_CONFIG_FILE = path.join(ROOT_DIR, 'config', 'xianyu_keywords.txt');
-const DEFAULT_KEYWORD_TYPE = 'general';
-const DEFAULT_GAME_NAME = 'default';
+const LOCAL_DEFAULTS_FILE = path.join(ROOT_DIR, 'config', 'xianyu_local_defaults.json');
+function loadLocalDefaults() {
+  try {
+    const raw = fsSync.readFileSync(LOCAL_DEFAULTS_FILE, 'utf8');
+    const parsed = JSON.parse(raw.replace(/^\uFEFF/, ''));
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+const LOCAL_DEFAULTS = loadLocalDefaults();
+const DEFAULT_KEYWORD_TYPE = String(LOCAL_DEFAULTS.keyword_type || LOCAL_DEFAULTS.keywordType || 'general').trim() || 'general';
+const DEFAULT_GAME_NAME = String(LOCAL_DEFAULTS.game_name || LOCAL_DEFAULTS.gameName || 'default').trim() || 'default';
 
 function parseCsv(raw) {
   const text = String(raw || '').replace(/^\uFEFF/, '');

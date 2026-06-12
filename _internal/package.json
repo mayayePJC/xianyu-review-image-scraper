@@ -1,0 +1,15 @@
+{
+  "name": "xianyu-review-image-scraper",
+  "version": "1.0.0",
+  "private": false,
+  "description": "Local Xianyu/Goofish public review image scraper and dashboard.",
+  "scripts": {
+    "discover:links": "node xianyu_public_review_image_scraper.cjs --mode discover-links",
+    "download:images": "node xianyu_public_review_image_scraper.cjs --mode download-images",
+    "site": "node generate_site.cjs",
+    "dashboard": "node dashboard_server.cjs"
+  },
+  "dependencies": {
+    "playwright-core": "latest"
+  }
+}

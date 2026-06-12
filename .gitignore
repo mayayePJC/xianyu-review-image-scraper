@@ -1,0 +1,31 @@
+# Runtime data
+data/
+images/
+logs/
+site/
+browser_profile/
+
+# Local private config
+config/xianyu_keywords.txt
+config/xianyu_item_urls.txt
+config/ocr_uid_calibration.local.json
+
+# Internal runtime artifacts
+_internal/node_modules/
+_internal/logs/
+_internal/backups/
+_internal/debug_artifacts/
+_internal/browser_profile/
+_internal/__pycache__/
+_internal/tmp_pycache/
+_internal/ocr_uid_calibration.local.json
+
+# Node / Python / OS noise
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.py[cod]
+*.pyo
+.Python
+.DS_Store
+Thumbs.db

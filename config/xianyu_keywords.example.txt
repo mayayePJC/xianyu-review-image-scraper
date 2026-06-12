@@ -1,0 +1,5 @@
+# One keyword per line.
+# Copy this file to xianyu_keywords.txt and edit it locally.
+sample keyword
+game account
+review image

@@ -1,0 +1,4 @@
+# Optional manual mode.
+# Put one public item URL per line.
+# You can also prefix a keyword with a tab:
+# sample keyword	https://www.goofish.com/item?id=REPLACE_WITH_ITEM_ID

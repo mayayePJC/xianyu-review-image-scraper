@@ -439,21 +439,60 @@ async function cleanAfterAction(page, opts) {
 }
 
 async function closeExtraPages(context, keepPages = [], opts = {}) {
-  const keep = new Set(keepPages.filter(Boolean));
+  const keep = new Set(keepPages.filter((page) => page && !page.isClosed()));
   const openPages = context.pages().filter((page) => !page.isClosed());
   const maxOpenPages = Math.max(1, Number(opts.maxOpenPages || DEFAULTS.maxOpenPages));
   const closeList = openPages.filter((page) => !keep.has(page));
-  const overflow = Math.max(0, openPages.length - maxOpenPages);
-  for (const page of closeList.slice(0, overflow || closeList.length)) {
+  const allowedNonKeep = Math.max(0, maxOpenPages - keep.size);
+  const closeCount = Math.max(0, closeList.length - allowedNonKeep);
+  for (const page of closeList.slice(0, closeCount)) {
     await page.close().catch(() => {});
   }
 }
 
 async function newManagedPage(context, opts, keepPages = []) {
-  await closeExtraPages(context, keepPages, opts);
+  const maxOpenPages = Math.max(1, Number(opts.maxOpenPages || DEFAULTS.maxOpenPages));
+  const keep = keepPages.filter((page) => page && !page.isClosed()).slice(-(maxOpenPages - 1));
+  const beforePages = context.pages().filter((page) => !page.isClosed());
+  const beforeKeep = new Set(keep);
+  const allowedBeforeOpen = Math.max(0, maxOpenPages - keep.length - 1);
+  const closeBeforeOpen = beforePages.filter((page) => !beforeKeep.has(page)).slice(allowedBeforeOpen);
+  for (const page of closeBeforeOpen) {
+    await page.close().catch(() => {});
+  }
   const page = await context.newPage();
-  await closeExtraPages(context, [...keepPages, page], opts);
+  await closeExtraPages(context, [...keep, page], opts);
   return page;
+}
+
+async function closeAllOpenPages(context, label = 'browser pages') {
+  const pages = context.pages().filter((page) => !page.isClosed());
+  for (const page of pages) {
+    await page.close().catch(() => {});
+  }
+  if (pages.length) console.log(`Closed ${pages.length} restored ${label}.`);
+  return pages.length;
+}
+
+async function clearSessionRestoreFiles(userDataDir) {
+  const profileDir = path.resolve(userDataDir, 'Default');
+  const targets = [
+    path.join(profileDir, 'Sessions'),
+    path.join(profileDir, 'Current Session'),
+    path.join(profileDir, 'Current Tabs'),
+    path.join(profileDir, 'Last Session'),
+    path.join(profileDir, 'Last Tabs'),
+  ];
+  let removed = 0;
+  for (const target of targets) {
+    try {
+      await fs.rm(target, { recursive: true, force: true });
+      removed += 1;
+    } catch {
+      // Session restore cleanup is best-effort; cookies and login data stay intact.
+    }
+  }
+  if (removed) console.log(`Cleared browser session-restore records from ${profileDir}.`);
 }
 
 async function gotoPage(page, url, opts) {
@@ -1479,6 +1518,7 @@ async function getContext(chromium, opts) {
       console.warn('Fallback to launching Edge through Playwright.');
     }
   }
+  await clearSessionRestoreFiles(opts.userDataDir);
   const context = await chromium.launchPersistentContext(path.resolve(opts.userDataDir), {
     channel: opts.channel,
     headless: false,
@@ -1503,7 +1543,10 @@ async function main() {
   const { chromium } = loadPlaywright();
   const { browser, context, ownsContext } = await getContext(chromium, opts);
   context.setDefaultTimeout(15000);
-  if (ownsContext) await closeExtraPages(context, [], opts);
+  if (ownsContext) {
+    await sleep(1000);
+    await closeAllOpenPages(context, 'browser pages');
+  }
   console.log(`Mode: ${opts.mode}`);
   console.log(`Run folder: ${runDir}`);
   try {

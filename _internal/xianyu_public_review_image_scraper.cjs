@@ -19,14 +19,14 @@ const DEFAULTS = {
   maxCandidates: 10,
   maxCandidatesPerKeyword: 10,
   maxInspectPages: 10,
-  maxRefreshPages: 10,
-  maxOpenPages: 3,
+  maxRefreshPages: 0,
+  maxOpenPages: 2,
   maxInvalidInspects: 6,
   maxConsecutiveInvalidInspects: 4,
   maxLinksPerRun: 1,
   maxImagesPerRun: 30,
-  maxSellerNamesPerRun: 30,
-  skipSellerNameRefresh: false,
+  maxSellerNamesPerRun: 5,
+  skipSellerNameRefresh: true,
   linkIds: '',
   keywords: '',
   scrollSteps: 16,
@@ -200,7 +200,7 @@ function clampDiscoverOptions(opts) {
   opts.maxCandidates = Math.max(1, Math.min(30, Number(opts.maxCandidates) || DEFAULTS.maxCandidates));
   opts.maxInspectPages = Math.max(0, Math.min(12, Number(opts.maxInspectPages) || DEFAULTS.maxInspectPages));
   opts.maxRefreshPages = Math.max(0, Math.min(5, Number(opts.maxRefreshPages) || DEFAULTS.maxRefreshPages));
-  opts.maxOpenPages = Math.max(2, Math.min(4, Number(opts.maxOpenPages) || DEFAULTS.maxOpenPages));
+  opts.maxOpenPages = Math.max(1, Math.min(2, Number(opts.maxOpenPages) || DEFAULTS.maxOpenPages));
   opts.maxInvalidInspects = Math.max(1, Math.min(12, Number(opts.maxInvalidInspects) || DEFAULTS.maxInvalidInspects));
   opts.maxConsecutiveInvalidInspects = Math.max(1, Math.min(6, Number(opts.maxConsecutiveInvalidInspects) || DEFAULTS.maxConsecutiveInvalidInspects));
   return opts;
@@ -447,6 +447,13 @@ async function closeExtraPages(context, keepPages = [], opts = {}) {
   for (const page of closeList.slice(0, overflow || closeList.length)) {
     await page.close().catch(() => {});
   }
+}
+
+async function newManagedPage(context, opts, keepPages = []) {
+  await closeExtraPages(context, keepPages, opts);
+  const page = await context.newPage();
+  await closeExtraPages(context, [...keepPages, page], opts);
+  return page;
 }
 
 async function gotoPage(page, url, opts) {
@@ -916,7 +923,8 @@ async function downloadImageFromCandidates(context, urls, tempPath, opts) {
 
 async function inspectCandidatePage(context, item, keyword, opts) {
   const pagesBeforeInspect = new Set(context.pages());
-  const page = await context.newPage();
+  const keepPages = Array.from(pagesBeforeInspect).filter((itemPage) => !itemPage.isClosed());
+  const page = await newManagedPage(context, opts, keepPages);
   try {
     const ok = await gotoPage(page, item.url, opts);
     if (!ok) {
@@ -959,7 +967,8 @@ async function inspectCandidatePage(context, item, keyword, opts) {
 
 async function inspectExistingLinkRow(context, row, opts) {
   const pagesBeforeInspect = new Set(context.pages());
-  const page = await context.newPage();
+  const keepPages = Array.from(pagesBeforeInspect).filter((itemPage) => !itemPage.isClosed());
+  const page = await newManagedPage(context, opts, keepPages);
   try {
     const knownSellerUrl = row.seller_url || (isPersonalPage(row.review_url) ? row.review_url : '');
     const startUrl = knownSellerUrl || row.item_url || row.review_url;
@@ -998,7 +1007,7 @@ async function inspectExistingLinkRow(context, row, opts) {
 }
 
 async function extractSellerNameForLinkRow(context, row, opts) {
-  const page = await context.newPage();
+  const page = await newManagedPage(context, opts);
   try {
     const knownSellerUrl = row.seller_url || (isPersonalPage(row.review_url) ? row.review_url : '');
     const startUrl = knownSellerUrl || row.item_url || row.review_url;
@@ -1070,7 +1079,7 @@ async function discoverLinks(context, keywords, opts, run) {
   const seenCandidateKeys = new Set(rows.flatMap((row) => [row.link_id, itemKeyFromUrl(row.item_url), userIdFromUrl(row.seller_url)].filter(Boolean)));
   const batchCsv = path.join(run.runDir, 'candidate_links_batch.csv');
   await initCsv(batchCsv, LINK_STATE_HEADERS);
-  const searchPage = await context.newPage();
+  const searchPage = await newManagedPage(context, opts);
   let written = 0;
   let inspected = 0;
   let invalidInspects = 0;
@@ -1268,7 +1277,7 @@ async function refreshSellerNames(context, opts, run) {
 }
 
 async function downloadImagesForLink(context, linkRow, opts, run, linkRows, imageRows) {
-  const page = await context.newPage();
+  const page = await newManagedPage(context, opts);
   const linkId = linkRow.link_id;
   const sellerId = sellerIdFromLinkRow(linkRow);
   const byImageId = new Map(imageRows.map((row) => [row.image_id, row]));
@@ -1464,7 +1473,7 @@ async function getContext(chromium, opts) {
     try {
       const browser = await chromium.connectOverCDP(opts.cdpUrl);
       const context = browser.contexts()[0] || (await browser.newContext());
-      return { browser, context };
+      return { browser, context, ownsContext: false };
     } catch (error) {
       console.warn(`CDP connect failed: ${error.message}`);
       console.warn('Fallback to launching Edge through Playwright.');
@@ -1478,7 +1487,7 @@ async function getContext(chromium, opts) {
     timezoneId: 'Asia/Shanghai',
     acceptDownloads: false,
   });
-  return { browser: null, context };
+  return { browser: null, context, ownsContext: true };
 }
 
 async function main() {
@@ -1492,8 +1501,9 @@ async function main() {
   await fs.mkdir(runDir, { recursive: true });
   const run = { runDir, imagesDownloaded: 0 };
   const { chromium } = loadPlaywright();
-  const { browser, context } = await getContext(chromium, opts);
+  const { browser, context, ownsContext } = await getContext(chromium, opts);
   context.setDefaultTimeout(15000);
+  if (ownsContext) await closeExtraPages(context, [], opts);
   console.log(`Mode: ${opts.mode}`);
   console.log(`Run folder: ${runDir}`);
   try {

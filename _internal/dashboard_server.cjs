@@ -657,7 +657,7 @@ async function handleApi(req, res, url) {
       '--max-candidates-per-keyword', String(candidatesPerKeyword),
       '--max-inspect-pages', String(maxInspectPages),
       '--max-refresh-pages', '0',
-      '--max-open-pages', '3',
+      '--max-open-pages', '2',
       '--max-invalid-inspects', '6',
       '--max-consecutive-invalid-inspects', '4',
       '--skip-seller-name-refresh',

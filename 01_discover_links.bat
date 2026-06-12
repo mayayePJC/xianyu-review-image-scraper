@@ -43,9 +43,11 @@ echo Batch limits:
 echo   max keywords: 3
 echo   max new links: 10
 echo   max review checks: 10
+echo   max open browser pages: 2
+echo   seller-name refresh: skipped during link discovery
 echo.
 
-"%NODE_EXE%" "_internal\xianyu_public_review_image_scraper.cjs" --mode discover-links --cdp-url= --max-keywords 3 --max-candidates 10 --max-candidates-per-keyword 10 --max-inspect-pages 10 --scroll-steps 8 --min-delay-ms 1200 --max-delay-ms 2500
+"%NODE_EXE%" "_internal\xianyu_public_review_image_scraper.cjs" --mode discover-links --cdp-url= --max-keywords 3 --max-candidates 10 --max-candidates-per-keyword 10 --max-inspect-pages 10 --max-refresh-pages 0 --max-open-pages 2 --skip-seller-name-refresh --scroll-steps 8 --min-delay-ms 1200 --max-delay-ms 2500
 
 set "EXIT_CODE=%ERRORLEVEL%"
 echo.

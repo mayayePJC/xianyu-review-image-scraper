@@ -7,7 +7,8 @@
     "discover:links": "node xianyu_public_review_image_scraper.cjs --mode discover-links",
     "download:images": "node xianyu_public_review_image_scraper.cjs --mode download-images",
     "site": "node generate_site.cjs",
-    "dashboard": "node dashboard_server.cjs"
+    "dashboard": "node dashboard_server.cjs",
+    "test": "node test_page_management.cjs"
   },
   "dependencies": {
     "playwright-core": "latest"

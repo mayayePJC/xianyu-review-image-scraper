@@ -2514,6 +2514,13 @@ function appJs() {
     return String(line || '').replace(/\\s+/g, ' ').trim().slice(0, 180);
   }
 
+  function taskFailureDetail(task) {
+    const error = compactLogLine(task && task.error);
+    if (error) return error;
+    const lines = Array.isArray(task && task.lastOutputLines) ? task.lastOutputLines : [];
+    return lines.map(compactLogLine).filter(Boolean).slice(-2).join(' / ');
+  }
+
   function setActionPending(action, text) {
     if (!action) return;
     if (!action.dataset.originalText) action.dataset.originalText = action.textContent;
@@ -2664,7 +2671,9 @@ function appJs() {
       }
       if (data.history && data.history.length) {
         const last = data.history[0];
-        setStatus('最近任务：' + last.label + ' / ' + last.status + '。任务结束后页面已重新生成，可刷新查看。', last.status === 'failed');
+        const detail = last.status === 'failed' ? taskFailureDetail(last) : '';
+        const suffix = detail ? '；原因：' + detail : '';
+        setStatus('最近任务：' + last.label + ' / ' + last.status + suffix + '。任务结束后页面已重新生成，可刷新查看。', last.status === 'failed');
       }
     } catch {
       setStatus('本页是静态打开的；请双击 04_start_dashboard.bat 后用本地 dashboard 操作。', true);

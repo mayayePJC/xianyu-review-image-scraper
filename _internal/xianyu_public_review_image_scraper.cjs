@@ -2,6 +2,7 @@
 'use strict';
 
 const fs = require('fs/promises');
+const fsSync = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
@@ -455,23 +456,49 @@ async function newManagedPage(context, opts, keepPages = []) {
   const keep = keepPages.filter((page) => page && !page.isClosed()).slice(-(maxOpenPages - 1));
   const beforePages = context.pages().filter((page) => !page.isClosed());
   const beforeKeep = new Set(keep);
+  const reusablePage = beforePages.find((page) => !beforeKeep.has(page));
+  if (reusablePage) {
+    await closeExtraPages(context, [...keep, reusablePage], opts);
+    return reusablePage;
+  }
   const allowedBeforeOpen = Math.max(0, maxOpenPages - keep.length - 1);
   const closeBeforeOpen = beforePages.filter((page) => !beforeKeep.has(page)).slice(allowedBeforeOpen);
   for (const page of closeBeforeOpen) {
     await page.close().catch(() => {});
   }
-  const page = await context.newPage();
+  let page;
+  try {
+    page = await context.newPage();
+  } catch (error) {
+    await closeExtraPages(context, keep, { ...opts, maxOpenPages: Math.max(1, keep.length) });
+    await sleep(500);
+    page = await context.newPage();
+  }
   await closeExtraPages(context, [...keep, page], opts);
   return page;
 }
 
-async function closeAllOpenPages(context, label = 'browser pages') {
+async function closeAllOpenPages(context, label = 'browser pages', keepCount = 0) {
   const pages = context.pages().filter((page) => !page.isClosed());
-  for (const page of pages) {
+  const keep = keepCount > 0 ? new Set(pages.slice(-keepCount)) : new Set();
+  const closePages = pages.filter((page) => !keep.has(page));
+  for (const page of closePages) {
     await page.close().catch(() => {});
   }
-  if (pages.length) console.log(`Closed ${pages.length} restored ${label}.`);
-  return pages.length;
+  if (closePages.length) console.log(`Closed ${closePages.length} restored ${label}${keep.size ? `; kept ${keep.size} page for reuse.` : '.'}`);
+  return closePages.length;
+}
+
+async function releaseManagedPage(context, page, opts = {}) {
+  if (!page || page.isClosed()) return;
+  const openPages = context.pages().filter((item) => !item.isClosed());
+  const hasOtherOpenPage = openPages.some((item) => item !== page);
+  if (hasOtherOpenPage) {
+    await page.close().catch(() => {});
+    return;
+  }
+  await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => {});
+  await closeExtraPages(context, [page], opts);
 }
 
 async function clearSessionRestoreFiles(userDataDir) {
@@ -720,6 +747,10 @@ async function extractSellerNameFromPersonalPage(page) {
 async function clickTextLike(context, page, regexSource, label, opts) {
   await closeLoginPopups(page);
   const beforePages = new Set(context.pages());
+  const maxOpenPages = Math.max(1, Number(opts.maxOpenPages || DEFAULTS.maxOpenPages));
+  const protectedPages = Array.from(beforePages)
+    .filter((existingPage) => existingPage !== page && !existingPage.isClosed())
+    .slice(-Math.max(0, maxOpenPages - 1));
   const clicked = await page
     .evaluate((source) => {
       const re = new RegExp(source, 'i');
@@ -775,10 +806,10 @@ async function clickTextLike(context, page, regexSource, label, opts) {
     }
     await newPage.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
     await cleanAfterAction(newPage, opts);
-    await closeExtraPages(context, [newPage], opts);
+    await closeExtraPages(context, [...protectedPages, newPage], opts);
     return { page: newPage, clicked: true };
   }
-  await closeExtraPages(context, [page], opts);
+  await closeExtraPages(context, [...protectedPages, page], opts);
   return { page, clicked: true };
 }
 
@@ -999,7 +1030,7 @@ async function inspectCandidatePage(context, item, keyword, opts) {
     };
   } finally {
     for (const openedPage of context.pages()) {
-      if (!pagesBeforeInspect.has(openedPage)) await openedPage.close().catch(() => {});
+      if (!pagesBeforeInspect.has(openedPage)) await releaseManagedPage(context, openedPage, opts);
     }
   }
 }
@@ -1040,7 +1071,7 @@ async function inspectExistingLinkRow(context, row, opts) {
     };
   } finally {
     for (const openedPage of context.pages()) {
-      if (!pagesBeforeInspect.has(openedPage)) await openedPage.close().catch(() => {});
+      if (!pagesBeforeInspect.has(openedPage)) await releaseManagedPage(context, openedPage, opts);
     }
   }
 }
@@ -1071,7 +1102,7 @@ async function extractSellerNameForLinkRow(context, row, opts) {
     }
     return { status: sellerName ? 'ok' : 'seller_name_not_found', sellerUrl, sellerName };
   } finally {
-    await page.close().catch(() => {});
+    await releaseManagedPage(context, page, opts);
   }
 }
 
@@ -1449,7 +1480,7 @@ async function downloadImagesForLink(context, linkRow, opts, run, linkRows, imag
     syncSellerImageStateToLinks(linkRow, linkRows, imageRows);
     return { found: images.length, downloaded: downloadedThisLink, status: linkRow.image_status };
   } finally {
-    await page.close().catch(() => {});
+    await releaseManagedPage(context, page, opts);
   }
 }
 
@@ -1540,16 +1571,22 @@ async function main() {
   const runDir = path.resolve(opts.logsDir, `run_${stamp()}_${opts.mode}`);
   await fs.mkdir(runDir, { recursive: true });
   const run = { runDir, imagesDownloaded: 0 };
-  const { chromium } = loadPlaywright();
-  const { browser, context, ownsContext } = await getContext(chromium, opts);
-  context.setDefaultTimeout(15000);
-  if (ownsContext) {
-    await sleep(1000);
-    await closeAllOpenPages(context, 'browser pages');
-  }
-  console.log(`Mode: ${opts.mode}`);
-  console.log(`Run folder: ${runDir}`);
+  await fs.writeFile(path.join(runDir, 'run_config.json'), JSON.stringify(opts, null, 2), 'utf8');
+  let browser = null;
+  let context = null;
   try {
+    const { chromium } = loadPlaywright();
+    const contextResult = await getContext(chromium, opts);
+    browser = contextResult.browser;
+    context = contextResult.context;
+    const ownsContext = contextResult.ownsContext;
+    context.setDefaultTimeout(15000);
+    if (ownsContext) {
+      await sleep(1000);
+      await closeAllOpenPages(context, 'browser pages', 1);
+    }
+    console.log(`Mode: ${opts.mode}`);
+    console.log(`Run folder: ${runDir}`);
     if (opts.mode === 'discover-links') {
       const keywords = await loadKeywords(opts);
       console.log(`Keywords: ${keywords.join(', ') || '(none)'}`);
@@ -1559,7 +1596,6 @@ async function main() {
         : await refreshSellerNames(context, opts, run);
       result.sellerNameRefresh = sellerNameResult;
       await fs.writeFile(path.join(runDir, 'summary.json'), JSON.stringify(result.summary, null, 2), 'utf8');
-      await fs.writeFile(path.join(runDir, 'run_config.json'), JSON.stringify(opts, null, 2), 'utf8');
       console.log('\nDone.');
       console.log(`Link state: ${result.linkFile}`);
       console.log(`Batch CSV: ${result.batchCsv}`);
@@ -1569,7 +1605,6 @@ async function main() {
     }
     if (opts.mode === 'refresh-seller-names') {
       const result = await refreshSellerNames(context, opts, run);
-      await fs.writeFile(path.join(runDir, 'run_config.json'), JSON.stringify(opts, null, 2), 'utf8');
       await fs.writeFile(path.join(runDir, 'summary.json'), JSON.stringify(result, null, 2), 'utf8');
       console.log('\nDone.');
       console.log(`Link state: ${result.linkFile}`);
@@ -1578,18 +1613,36 @@ async function main() {
       return;
     }
     const result = await downloadImages(context, opts, run);
-    await fs.writeFile(path.join(runDir, 'run_config.json'), JSON.stringify(opts, null, 2), 'utf8');
     console.log('\nDone.');
     console.log(`Link state: ${linkStatePath(opts)}`);
     console.log(`Image state: ${imageStatePath(opts)}`);
     console.log(`Downloaded images this run: ${result.downloadedImages}`);
   } finally {
-    await context.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
     if (browser) await browser.close().catch(() => {});
   }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error);
+    const logsDirArg = process.argv.find((arg) => arg.startsWith('--logs-dir=') || arg.startsWith('--logsDir='));
+    const logsDir = logsDirArg ? logsDirArg.split('=').slice(1).join('=') : 'logs';
+    const fallbackDir = path.resolve(logsDir, `run_${stamp()}_failed`);
+    try {
+      fsSync.mkdirSync(fallbackDir, { recursive: true });
+      fsSync.writeFileSync(path.join(fallbackDir, 'error.txt'), `${error.stack || error.message || String(error)}\n`, 'utf8');
+    } catch {
+      // Best effort. The original error is already printed to stderr.
+    }
+    process.exit(1);
+  });
+} else {
+  module.exports = {
+    clickTextLike,
+    closeExtraPages,
+    closeAllOpenPages,
+    newManagedPage,
+    releaseManagedPage,
+  };
+}

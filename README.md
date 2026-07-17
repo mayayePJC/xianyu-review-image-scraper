@@ -11,6 +11,7 @@ This repository contains only the crawler source code and safe example configura
 - Download review images into local folders.
 - Generate a local HTML dashboard for sellers, item leads, images, and keywords.
 - Run optional local OCR over downloaded images and export UID results.
+- Checkpoint link, image, and OCR state during long tasks so a later run can resume saved work.
 
 ## Setup
 
@@ -49,6 +50,17 @@ npm run discover:links
 npm run download:images
 npm run site
 npm run dashboard
+```
+
+The dashboard is served at `http://127.0.0.1:8788/`. The primary workflow is keywords, sellers, then images; the item-leads page is read-only detail. Browser work is sequential and keeps at most two crawler pages open. A single seller failure is recorded and does not discard the rest of the batch.
+
+Only `confirmed_no_images` records are skipped permanently. Older or failed inspections are treated as unknown and checked again when selected, preventing a missing/changed page control from becoming a false no-image result.
+
+Run the local regression suite after changes:
+
+```bash
+cd _internal
+npm test
 ```
 
 ## Data Safety

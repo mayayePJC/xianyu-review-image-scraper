@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -69,8 +71,8 @@ def load_local_calibration_samples() -> Dict[str, str]:
             continue
         try:
             raw = json.loads(path.read_text(encoding="utf-8-sig"))
-        except Exception:
-            continue
+        except Exception as exc:
+            raise RuntimeError(f"Cannot read OCR calibration file: {path}: {exc}") from exc
         if isinstance(raw, dict):
             pairs = raw.items()
         elif isinstance(raw, list):
@@ -81,23 +83,37 @@ def load_local_calibration_samples() -> Dict[str, str]:
             image_id = str(image_id or "").strip()
             uid = str(uid or "").strip()
             if image_id and uid:
+                if len(uid) != 12 or not uid.isdigit() or not uid.startswith("2"):
+                    raise ValueError(f"Invalid calibration UID for {image_id}: expected 12 digits starting with 2")
                 samples[image_id] = uid
     return samples
 
 
 def write_csv_rows(path: Path, rows: List[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=IMAGE_STATE_HEADERS, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({header: row.get(header, "") for header in IMAGE_STATE_HEADERS})
+    temp_path = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=IMAGE_STATE_HEADERS, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({header: row.get(header, "") for header in IMAGE_STATE_HEADERS})
+        for attempt in range(7):
+            try:
+                os.replace(temp_path, path)
+                break
+            except PermissionError:
+                if attempt >= 6:
+                    raise
+                time.sleep(0.025 * (attempt + 1))
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
-def resolve_local_path(raw: str) -> Path:
+def resolve_local_path(raw: str) -> Optional[Path]:
     text = str(raw or "").strip()
     if not text:
-        return Path()
+        return None
     path = Path(text)
     if path.is_absolute():
         return path
@@ -503,32 +519,60 @@ def add_templates_from_sample(templates: Dict[str, List[Image.Image]], sample_im
     return added
 
 
-def build_templates(rows: List[dict], exclude_image_ids: Optional[Iterable[str]] = None) -> Dict[str, List[Image.Image]]:
+def build_template_library(
+    rows: List[dict],
+    calibration_samples: Dict[str, str],
+) -> Dict[str, Dict[str, List[Image.Image]]]:
     rows_by_id = {row.get("image_id"): row for row in rows}
-    excluded = {str(image_id or "").strip() for image_id in (exclude_image_ids or [])}
-    templates: Dict[str, List[Image.Image]] = {}
-    used = 0
-    for image_id, uid in load_local_calibration_samples().items():
-        if image_id in excluded:
-            continue
+    library: Dict[str, Dict[str, List[Image.Image]]] = {}
+    for image_id, uid in calibration_samples.items():
         row = rows_by_id.get(image_id)
         if not row:
             continue
         path = resolve_local_path(row.get("local_path", ""))
-        if path.exists() and add_templates_from_sample(templates, path, uid):
-            used += 1
-    if not used:
+        sample_templates: Dict[str, List[Image.Image]] = {}
+        if path and path.exists() and add_templates_from_sample(sample_templates, path, uid):
+            library[image_id] = sample_templates
+    if not library:
         sample = find_sample_path(rows)
-        if sample and add_templates_from_sample(templates, sample, UID_SAMPLE_VALUE):
-            used += 1
+        sample_templates = {}
+        if sample and add_templates_from_sample(sample_templates, sample, UID_SAMPLE_VALUE):
+            library[UID_SAMPLE_IMAGE_ID] = sample_templates
+    if not library:
+        raise RuntimeError("Cannot build UID templates: no usable calibration image found.")
+    return library
+
+
+def templates_from_library(
+    library: Dict[str, Dict[str, List[Image.Image]]],
+    exclude_image_ids: Optional[Iterable[str]] = None,
+) -> Dict[str, List[Image.Image]]:
+    excluded = {str(image_id or "").strip() for image_id in (exclude_image_ids or [])}
+    templates: Dict[str, List[Image.Image]] = {}
+    for image_id, sample_templates in library.items():
+        if image_id in excluded:
+            continue
+        for digit, glyphs in sample_templates.items():
+            templates.setdefault(digit, []).extend(glyphs)
+    if not templates:
+        raise RuntimeError("Cannot build UID templates after excluding calibration samples.")
     missing_digits = [str(digit) for digit in range(10) if str(digit) not in templates]
     if missing_digits:
         fallback = fallback_templates()
         for digit in missing_digits:
-            templates.setdefault(digit, []).extend(fallback.get(digit, []))
-    if not templates:
-        raise RuntimeError("Cannot build UID templates: no calibration UID text found.")
+            glyphs = fallback.get(digit, [])
+            if glyphs:
+                templates.setdefault(digit, []).extend(glyphs)
     return templates
+
+
+def build_templates(
+    rows: List[dict],
+    exclude_image_ids: Optional[Iterable[str]] = None,
+    calibration_samples: Optional[Dict[str, str]] = None,
+) -> Dict[str, List[Image.Image]]:
+    samples = load_local_calibration_samples() if calibration_samples is None else calibration_samples
+    return templates_from_library(build_template_library(rows, samples), exclude_image_ids)
 
 
 def fallback_templates() -> Dict[str, List[Image.Image]]:
@@ -714,13 +758,9 @@ def find_sample_path(rows: List[dict]) -> Optional[Path]:
     for row in rows:
         if row.get("image_id") == UID_SAMPLE_IMAGE_ID:
             path = resolve_local_path(row.get("local_path", ""))
-            if path.exists():
+            if path and path.exists():
                 return path
     return None
-
-
-def manually_verified_uid(image_id: str) -> str:
-    return load_local_calibration_samples().get(str(image_id or "").strip(), "")
 
 
 def main() -> int:
@@ -738,7 +778,26 @@ def main() -> int:
     image_state = Path(args.image_state)
     rows = read_csv_rows(image_state)
     selected_link_ids = {item.strip() for item in str(args.link_ids or "").replace(",", " ").split() if item.strip()}
-    shared_templates = build_templates(rows)
+
+    pending_total = 0
+    for row in rows:
+        if args.only_image_id and row.get("image_id") != args.only_image_id:
+            continue
+        if selected_link_ids and row.get("link_id") not in selected_link_ids:
+            continue
+        if args.only_existing_uid and not str(row.get("uid") or "").strip():
+            continue
+        if args.resume and not args.force and "uid_ocr:" in str(row.get("notes") or ""):
+            continue
+        pending_total += 1
+    print(f"TASK_PROGRESS ocr-uids done=0 total={pending_total}", flush=True)
+    calibration_samples: Dict[str, str] = {}
+    template_library: Dict[str, Dict[str, List[Image.Image]]] = {}
+    shared_templates: Dict[str, List[Image.Image]] = {}
+    if pending_total:
+        calibration_samples = load_local_calibration_samples()
+        template_library = build_template_library(rows, calibration_samples)
+        shared_templates = templates_from_library(template_library)
 
     total = 0
     skipped_done = 0
@@ -766,11 +825,14 @@ def main() -> int:
         uid = ""
         note = ""
         image_id = row.get("image_id", "")
-        verified_uid = manually_verified_uid(image_id)
+        verified_uid = calibration_samples.get(str(image_id or "").strip(), "")
         templates = shared_templates
         if verified_uid:
-            templates = build_templates(rows, exclude_image_ids=[image_id])
-        if local_path.exists():
+            try:
+                templates = templates_from_library(template_library, exclude_image_ids=[image_id])
+            except RuntimeError:
+                templates = {}
+        if local_path and local_path.exists() and templates:
             uid, note = recognize_uid(local_path, templates)
             if verified_uid:
                 mismatch = uid_mismatch_detail(uid, verified_uid)
@@ -778,6 +840,8 @@ def main() -> int:
                     note = f"manual_verified_calibration:machine_uid={uid or '-'}:{note}:verified={verified_uid}:{mismatch}"
                 else:
                     note = f"manual_verified_calibration:{note}:verified_match"
+        elif local_path and local_path.exists() and verified_uid:
+            note = "manual_verified_calibration:machine_uid=-:no_independent_templates:ocr_skipped"
         else:
             note = "local_path_missing"
             if verified_uid:
@@ -813,6 +877,9 @@ def main() -> int:
         row["notes"] = "; ".join([*kept_notes, ocr_note])
         preserved = " preserved_existing" if preserved_existing else ""
         print(f"{row.get('image_id','')} uid={row['uid'] or '-'} usable={row['usable']} {note}{preserved}")
+        print(f"TASK_PROGRESS ocr-uids done={total} total={pending_total}", flush=True)
+        if not args.dry_run and total % 25 == 0:
+            write_csv_rows(image_state, rows)
 
     if not args.dry_run:
         write_csv_rows(image_state, rows)

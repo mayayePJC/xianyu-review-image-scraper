@@ -4,6 +4,11 @@
 const fs = require('fs/promises');
 const fsSync = require('fs');
 const path = require('path');
+const {
+  readCsvRows: readCsv,
+  writeCsvRows: writeCsv,
+  writeFileAtomic,
+} = require('./csv_utils.cjs');
 
 const ROOT_DIR = path.basename(__dirname).toLowerCase() === '_internal' ? path.resolve(__dirname, '..') : __dirname;
 const DATA_DIR = path.join(ROOT_DIR, 'data');
@@ -20,86 +25,14 @@ function loadLocalDefaults() {
     const raw = fsSync.readFileSync(LOCAL_DEFAULTS_FILE, 'utf8');
     const parsed = JSON.parse(raw.replace(/^\uFEFF/, ''));
     return parsed && typeof parsed === 'object' ? parsed : {};
-  } catch {
-    return {};
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return {};
+    throw new Error(`Cannot read local defaults: ${LOCAL_DEFAULTS_FILE}: ${error.message || String(error)}`);
   }
 }
 const LOCAL_DEFAULTS = loadLocalDefaults();
 const DEFAULT_KEYWORD_TYPE = String(LOCAL_DEFAULTS.keyword_type || LOCAL_DEFAULTS.keywordType || 'general').trim() || 'general';
 const DEFAULT_GAME_NAME = String(LOCAL_DEFAULTS.game_name || LOCAL_DEFAULTS.gameName || 'default').trim() || 'default';
-
-function parseCsv(raw) {
-  const text = String(raw || '').replace(/^\uFEFF/, '');
-  const records = [];
-  let row = [];
-  let cell = '';
-  let quoted = false;
-
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i];
-    if (quoted) {
-      if (ch === '"' && text[i + 1] === '"') {
-        cell += '"';
-        i += 1;
-      } else if (ch === '"') {
-        quoted = false;
-      } else {
-        cell += ch;
-      }
-      continue;
-    }
-
-    if (ch === '"') {
-      quoted = true;
-    } else if (ch === ',') {
-      row.push(cell);
-      cell = '';
-    } else if (ch === '\n' || ch === '\r') {
-      if (ch === '\r' && text[i + 1] === '\n') i += 1;
-      row.push(cell);
-      records.push(row);
-      row = [];
-      cell = '';
-    } else {
-      cell += ch;
-    }
-  }
-
-  if (cell.length || row.length) {
-    row.push(cell);
-    records.push(row);
-  }
-
-  if (!records.length) return [];
-  const headers = records[0].map((header) => String(header || '').trim());
-  return records.slice(1).filter((record) => record.some((value) => String(value || '').length)).map((record) => {
-    const out = {};
-    headers.forEach((header, index) => {
-      out[header] = record[index] ?? '';
-    });
-    return out;
-  });
-}
-
-function csvEscape(value) {
-  const s = String(value ?? '');
-  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-}
-
-async function readCsv(file) {
-  try {
-    return parseCsv(await fs.readFile(file, 'utf8'));
-  } catch (err) {
-    if (err && err.code === 'ENOENT') return [];
-    throw err;
-  }
-}
-
-async function writeCsv(file, headers, rows) {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  const body = [headers.join(','), ...rows.map((row) => headers.map((header) => csvEscape(row[header] ?? '')).join(','))].join('\r\n');
-  await fs.writeFile(file, `${body}\r\n`, 'utf8');
-}
 
 async function writeImageUidExport(images) {
   const headers = ['image_id', 'updated_at', 'uid'];
@@ -199,6 +132,13 @@ function statusValue(value, fallback = 'unknown') {
   return cleanText(value || fallback).toLowerCase() || fallback;
 }
 
+function effectiveHasImages(row) {
+  const value = statusValue(row?.has_images);
+  if (value !== 'no') return value;
+  const statuses = [row?.link_status, row?.image_status].map((item) => statusValue(item));
+  return statuses.includes('confirmed_no_images') ? 'no' : 'unknown';
+}
+
 const STATUS_LABELS = {
   yes: '有图',
   no: '无图',
@@ -212,6 +152,9 @@ const STATUS_LABELS = {
   not_inspected: '未检查',
   imported_unchecked: '导入未检查',
   with_pictures_not_found: '未找到带图评价',
+  confirmed_no_images: '确认无图',
+  collection_empty: '有图但本次未取到',
+  review_images_collection_empty: '有图但本次未取到',
   open_failed_or_blocked: '打开失败/受限',
   open_item_failed_or_blocked: '商品打开失败/受限',
   seller_open_failed: '卖家页打开失败',
@@ -220,6 +163,7 @@ const STATUS_LABELS = {
   saved_fallback_thumb: '已存缩略图',
   discarded_no_uid: '无 UID 已清理',
   download_failed: '下载失败',
+  crawl_failed: '爬取失败',
   local_path_missing: '本地缺失',
   high_confidence: '高置信',
   low_confidence: '低置信',
@@ -471,11 +415,12 @@ function buildSellerRows(links, imagesBySeller, keywordByText) {
       const value = timestampMs(link.last_image_crawl_at);
       return value > timestampMs(latest) ? link.last_image_crawl_at : latest;
     }, '');
-    seller.hasImages = seller.links.some((link) => statusValue(link.has_images) === 'yes') || seller.images.length ? 'yes'
-      : seller.links.some((link) => statusValue(link.has_images) === 'no') ? 'no'
+    const imageStates = seller.links.map(effectiveHasImages);
+    seller.hasImages = imageStates.includes('yes') || seller.images.length ? 'yes'
+      : imageStates.length && imageStates.every((value) => value === 'no') ? 'no'
         : 'unknown';
     seller.imageStatus = seller.images.length ? (seller.links.some((link) => statusValue(link.image_status) !== 'complete') ? 'partial' : 'complete')
-      : seller.links.some((link) => statusValue(link.image_status) === 'skipped_no_images') ? 'skipped_no_images'
+      : seller.hasImages === 'no' ? 'skipped_no_images'
         : 'unknown';
   }
   return Array.from(sellers.values()).sort((a, b) => {
@@ -593,24 +538,12 @@ function renderImageAction(linkId, sellerId, imagesForLink) {
   return `<a class="text-action" href="${escapeHtml(sellerImagePageHref(sellerId || linkId))}" title="查看这个卖家的图片">看图片</a>`;
 }
 
-function renderDownloadAction(linkId) {
-  return `<button class="text-action" type="button" data-run-link="${escapeHtml(linkId)}" title="爬取这个 link 的图片并更新状态">爬取图片</button>`;
-}
-
-function renderOcrAction(linkId, imagesForLink) {
-  const localCount = rowImageCount(imagesForLink);
-  if (!localCount) {
-    return `<span class="text-action text-action-disabled" title="暂无本地图片可识别" aria-disabled="true">识别UID</span>`;
-  }
-  return `<button class="text-action" type="button" data-run-link-ocr="${escapeHtml(linkId)}" title="只识别这个 link 下的图片 UID">识别UID</button>`;
-}
-
 function linkProgress(link, imagesForLink) {
   const totalFromState = numberValue(link.total_images);
   const downloadedFromState = numberValue(link.images_downloaded);
   const localCount = rowImageCount(imagesForLink);
-  const total = Math.max(totalFromState, localCount);
   const downloaded = Math.max(downloadedFromState, localCount);
+  const total = Math.max(totalFromState, downloaded, localCount);
   const remainingFromState = cleanText(link.images_remaining) === '' ? Math.max(0, total - downloaded) : numberValue(link.images_remaining);
   const remaining = Math.max(0, remainingFromState);
   const percent = total > 0 ? Math.min(100, Math.round((downloaded / total) * 100)) : 0;
@@ -641,7 +574,7 @@ function progressHtml(progress) {
 }
 
 function linkProcessStatus(link, progress, usability) {
-  const hasImages = statusValue(link.has_images);
+  const hasImages = effectiveHasImages(link);
   const imageState = statusValue(link.image_status);
   const linkState = statusValue(link.link_status);
   const raw = [link.link_status, link.image_status].map(cleanText).filter(Boolean).join(' / ');
@@ -651,7 +584,7 @@ function linkProcessStatus(link, progress, usability) {
   if (linkState.includes('failed') || imageState.includes('failed') || linkState.includes('blocked') || imageState.includes('blocked')) {
     key = 'check_failed';
     label = '检查失败/受限';
-  } else if (hasImages === 'no' || imageState === 'skipped_no_images' || imageState === 'with_pictures_not_found') {
+  } else if (hasImages === 'no') {
     key = 'no_images';
     label = '无图跳过';
   } else if (progress.downloaded > 0 && imageState === 'complete') {
@@ -711,10 +644,10 @@ function layout({ title, active, subtitle, body, generatedAt }) {
       <p>${escapeHtml(subtitle)}</p>
     </div>
     <nav class="tabs" aria-label="pages">
-      <a class="${sellersActive}" href="sellers.html">卖家</a>
+      <a class="${keywordsActive}" href="keywords.html">1 关键词</a>
+      <a class="${sellersActive}" href="sellers.html">2 卖家</a>
+      <a class="${imagesActive}" href="images.html">3 图片</a>
       <a class="${linksActive}" href="links.html">商品线索</a>
-      <a class="${imagesActive}" href="images.html">图片</a>
-      <a class="${keywordsActive}" href="keywords.html">关键词</a>
     </nav>
   </header>
   ${body}
@@ -783,23 +716,6 @@ function renderSellerImageAction(sellerId, imagesForSeller) {
     return `<span class="text-action text-action-disabled" title="暂无本地图片" aria-disabled="true">看图片</span>`;
   }
   return `<a class="text-action" href="${escapeHtml(sellerImagePageHref(sellerId))}" title="查看这个卖家的去重图片">看图片</a>`;
-}
-
-function renderSellerDownloadAction(sellerId, linkIds) {
-  const ids = Array.isArray(linkIds) ? linkIds.map(cleanText).filter(Boolean) : [];
-  if (!ids.length) {
-    return `<span class="text-action text-action-disabled" title="暂无可爬取的商品线索" aria-disabled="true">爬取图片</span>`;
-  }
-  return `<button class="text-action" type="button" data-run-seller="${escapeHtml(sellerId)}" data-run-seller-links="${escapeHtml(ids.join(','))}" title="爬取这个卖家的评价图；同卖家多商品只抓一次">爬取图片</button>`;
-}
-
-function renderSellerOcrAction(sellerId, imagesForSeller, linkIds) {
-  const localCount = rowImageCount(imagesForSeller);
-  if (!localCount) {
-    return `<span class="text-action text-action-disabled" title="暂无本地图片可识别" aria-disabled="true">识别UID</span>`;
-  }
-  const ids = Array.isArray(linkIds) ? linkIds.map(cleanText).filter(Boolean) : [];
-  return `<button class="text-action" type="button" data-run-seller-ocr="${escapeHtml(sellerId)}" data-run-seller-ocr-links="${escapeHtml(ids.join(','))}" title="只识别这个卖家下的图片 UID">识别UID</button>`;
 }
 
 function renderSellerLinksDetail(seller) {
@@ -902,8 +818,6 @@ function renderSellersPage(sellers, keywords, generatedAt) {
         <td class="preview-cell">${renderPreviewImages(imagesForSeller)}</td>
         <td class="actions-cell">
           ${renderSellerImageAction(sellerId, imagesForSeller)}
-          ${renderSellerDownloadAction(sellerId, sellerLinkIds)}
-          ${renderSellerOcrAction(sellerId, imagesForSeller, sellerLinkIds)}
         </td>
       </tr>
     `;
@@ -911,12 +825,6 @@ function renderSellersPage(sellers, keywords, generatedAt) {
 
   const body = `
   <main class="page">
-    <section class="workflow-strip">
-      <span>1 关键词页抓商品线索</span>
-      <span>2 卖家页按卖家爬评价图</span>
-      <span>3 图片页筛 UID，下载 CSV</span>
-    </section>
-
     <section class="stats-grid">
       ${statCard('卖家总数', String(totalSellers), `多商品卖家 ${multiLinkSellers}`, 'sellerRecords')}
       ${statCard('有图片卖家', String(sellersWithImages), `已隐藏重复图片 ${duplicateSavedImages}`, 'sellerWithImages')}
@@ -957,8 +865,7 @@ function renderSellersPage(sellers, keywords, generatedAt) {
 
     <section class="run-panel">
       <button type="button" data-run-selected-sellers disabled>${downloadIconSvg()}<span>爬取已勾选卖家的图片</span></button>
-      <button type="button" data-run-ocr>识别全部UID</button>
-      <div class="run-status" data-run-status>本地 dashboard 启动后可运行任务；按卖家爬图会自动跳过同卖家的重复商品线索。</div>
+      <div class="run-status" data-run-status>筛选并勾选卖家后统一抓图；同一卖家的重复商品线索会自动跳过。</div>
     </section>
 
     <section class="table-shell">
@@ -974,7 +881,7 @@ function renderSellersPage(sellers, keywords, generatedAt) {
             <th>处理状态</th>
             <th>最后抓取</th>
             <th>图片预览</th>
-            <th>操作</th>
+            <th>查看</th>
           </tr>
         </thead>
         <tbody>${rows || '<tr><td colspan="10" class="empty-cell">暂无卖家</td></tr>'}</tbody>
@@ -987,7 +894,7 @@ function renderSellersPage(sellers, keywords, generatedAt) {
   return layout({
     title: '卖家',
     active: 'sellers',
-    subtitle: '以卖家为主表；商品 links 只是线索，同卖家的评价图只保留一组',
+    subtitle: '第 2 步：筛选并勾选卖家，统一抓取评价图片',
     body,
     generatedAt,
   });
@@ -995,8 +902,8 @@ function renderSellersPage(sellers, keywords, generatedAt) {
 
 function renderLinksPage(links, imagesByLink, keywords, keywordByText, generatedAt) {
   const totalLinks = links.length;
-  const hasImages = links.filter((link) => statusValue(link.has_images) === 'yes').length;
-  const noImages = links.filter((link) => statusValue(link.has_images) === 'no').length;
+  const hasImages = links.filter((link) => effectiveHasImages(link) === 'yes').length;
+  const noImages = links.filter((link) => effectiveHasImages(link) === 'no').length;
   const unknownImages = totalLinks - hasImages - noImages;
   const downloadedLinks = links.filter((link) => {
     const imagesForLink = imagesByLink.get(cleanText(link.link_id)) || [];
@@ -1018,7 +925,7 @@ function renderLinksPage(links, imagesByLink, keywords, keywordByText, generated
     const imagesForLink = imagesByLink.get(linkId) || [];
     const progress = linkProgress(link, imagesForLink);
     const usability = imageUsabilityCounts(imagesForLink);
-    const hasImagesStatus = statusValue(link.has_images);
+    const hasImagesStatus = effectiveHasImages(link);
     const linkStatus = statusValue(link.link_status);
     const imageStatus = statusValue(link.image_status);
     const keywordType = keywordTypeOf(link.keyword, keywordByText);
@@ -1050,9 +957,6 @@ function renderLinksPage(links, imagesByLink, keywords, keywordByText, generated
           data-image-status="${escapeHtml(imageStatus)}"
           data-keyword-type="${escapeHtml(keywordType)}"
           data-game-name="${escapeHtml(gameName)}">
-        <td class="select-cell">
-          <input type="checkbox" data-link-check value="${escapeHtml(linkId)}" aria-label="选择 ${escapeHtml(linkId)}">
-        </td>
         <td class="id-cell">
           ${rowImageCount(imagesForLink) ? `<a class="mono strong" href="${escapeHtml(sellerImagePageHref(sellerId))}">${escapeHtml(linkId)}</a>` : `<span class="mono strong">${escapeHtml(linkId)}</span>`}
           <div class="small">${escapeHtml(cleanText(link.keyword) || '-')}</div>
@@ -1077,8 +981,6 @@ function renderLinksPage(links, imagesByLink, keywords, keywordByText, generated
         <td class="preview-cell">${renderPreviewImages(imagesForLink)}</td>
         <td class="actions-cell">
           ${renderImageAction(linkId, sellerId, imagesForLink)}
-          ${renderDownloadAction(linkId)}
-          ${renderOcrAction(linkId, imagesForLink)}
         </td>
       </tr>
     `;
@@ -1086,12 +988,6 @@ function renderLinksPage(links, imagesByLink, keywords, keywordByText, generated
 
   const body = `
   <main class="page">
-    <section class="workflow-strip">
-      <span>1 抓 links：发现并复查是否有图</span>
-      <span>2 爬图片：只处理有图 links</span>
-      <span>3 识别 UID：更新图片页和 CSV</span>
-    </section>
-
     <section class="stats-grid">
       ${statCard('links 总数', String(totalLinks), `有图 ${hasImages}`)}
       ${statCard('已下载图片的 links', String(downloadedLinks), `未确认 ${unknownImages}`)}
@@ -1141,17 +1037,10 @@ function renderLinksPage(links, imagesByLink, keywords, keywordByText, generated
       <div class="visible-count"><span data-visible-count>${totalLinks}</span> 条</div>
     </section>
 
-    <section class="run-panel">
-      <button type="button" data-run-selected disabled>${downloadIconSvg()}<span>爬取已勾选 links 的图片</span></button>
-      <button type="button" data-run-ocr>识别UID</button>
-      <div class="run-status" data-run-status>本地 dashboard 启动后可直接运行爬虫任务。</div>
-    </section>
-
     <section class="table-shell">
       <table class="data-table">
         <thead>
           <tr>
-            <th class="select-cell"><input type="checkbox" data-check-all aria-label="全选当前可见 links"></th>
             <th>Link ID</th>
             <th>卖家</th>
             <th>商品摘要</th>
@@ -1160,10 +1049,10 @@ function renderLinksPage(links, imagesByLink, keywords, keywordByText, generated
             <th>处理状态</th>
             <th>最后爬取</th>
             <th>图片预览</th>
-            <th>操作</th>
+            <th>查看</th>
           </tr>
         </thead>
-        <tbody>${rows || '<tr><td colspan="10" class="empty-cell">暂无 links</td></tr>'}</tbody>
+        <tbody>${rows || '<tr><td colspan="9" class="empty-cell">暂无 links</td></tr>'}</tbody>
       </table>
       <div class="empty-state" data-empty-state hidden>没有匹配的 links</div>
     </section>
@@ -1173,7 +1062,7 @@ function renderLinksPage(links, imagesByLink, keywords, keywordByText, generated
   return layout({
     title: '商品线索',
     active: 'links',
-    subtitle: '这些是发现卖家的商品入口；日常抓图和 UID 判断请优先用卖家页',
+    subtitle: '只读明细：查看关键词发现的链接、卖家和图片状态',
     body,
     generatedAt,
   });
@@ -1430,6 +1319,12 @@ function renderImagesPage(links, images, imagesBySeller, keywords, keywordByText
       ${statCard('当前可见', String(images.length), '随筛选变化', 'visibleImages')}
     </section>
 
+    <section class="run-panel image-actions">
+      <button type="button" data-run-ocr>识别图片 UID</button>
+      <a class="run-link" href="image_uid_export.csv" download="image_uid_filtered_export.csv" data-download-image-csv>${downloadIconSvg()}<span>下载当前筛选 CSV</span></a>
+      <div class="run-status" data-run-status>识别完成后，可按 UID、置信度和关键词筛选并导出当前结果。</div>
+    </section>
+
     <section class="toolbar">
       <label class="search-box">
         <span>搜索</span>
@@ -1459,7 +1354,6 @@ function renderImagesPage(links, images, imagesBySeller, keywords, keywordByText
       </label>
       <div class="visible-count"><span data-visible-count>${images.length}</span> 张</div>
     </section>
-    <div class="run-status image-run-status" data-run-status>清理无 UID 图片会先预估空间，确认后才执行。</div>
 
     <section class="gallery">
       ${groups || '<div class="empty-state always-visible">暂无图片记录</div>'}
@@ -1471,7 +1365,7 @@ function renderImagesPage(links, images, imagesBySeller, keywords, keywordByText
   return layout({
     title: '图片',
     active: 'images',
-    subtitle: '按卖家聚合并去重展示；link_id 只作为来源线索保留',
+    subtitle: '第 3 步：识别图片 UID，检查结果并下载当前筛选 CSV',
     body,
     generatedAt,
   });
@@ -1540,7 +1434,7 @@ function renderKeywordsPage(keywords, links, images, generatedAt) {
       <div class="keyword-actions">
         <button type="button" data-run-discover>${refreshIconSvg()}<span>抓筛选关键词</span></button>
       </div>
-      <div class="run-status" data-run-status>先筛选关键词类型，再抓筛选出的关键词 links；抓图片请到卖家页或商品线索页单独执行。</div>
+      <div class="run-status" data-run-status>只抓取当前筛选出的关键词；完成后到“2 卖家”页抓取图片。</div>
     </section>
 
     <section class="toolbar">
@@ -1590,7 +1484,7 @@ function renderKeywordsPage(keywords, links, images, generatedAt) {
   return layout({
     title: '关键词',
     active: 'keywords',
-    subtitle: '管理搜索关键词和关键词类型',
+    subtitle: '第 1 步：添加、分类并筛选关键词，然后抓取商品线索',
     body,
     generatedAt,
   });
@@ -1708,26 +1602,6 @@ select {
   margin: 20px auto 40px;
 }
 
-.workflow-strip {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 14px;
-}
-
-.workflow-strip span {
-  display: inline-flex;
-  align-items: center;
-  min-height: 30px;
-  padding: 0 10px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--panel-soft);
-  color: #475569;
-  font-size: 12px;
-  font-weight: 700;
-}
-
 .stats-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1811,7 +1685,8 @@ select {
   box-shadow: var(--shadow);
 }
 
-.run-panel button {
+.run-panel button,
+.run-panel .run-link {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1823,13 +1698,12 @@ select {
   color: var(--text);
   cursor: pointer;
   font-weight: 700;
-}
-
-.run-panel button {
   padding: 0 11px;
+  text-decoration: none;
 }
 
-.run-panel button:hover {
+.run-panel button:hover,
+.run-panel .run-link:hover {
   border-color: #a7d9d0;
   background: var(--accent-soft);
   color: var(--accent);
@@ -2257,6 +2131,8 @@ select {
 }
 
 .image-group {
+  width: 100%;
+  min-width: 0;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -2304,6 +2180,8 @@ select {
 }
 
 .image-list-shell {
+  min-width: 0;
+  max-width: 100%;
   overflow: auto;
 }
 
@@ -2471,6 +2349,18 @@ select {
 }
 
 @media (max-width: 560px) {
+  .tabs {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .tabs a {
+    width: 100%;
+    min-width: 0;
+    padding: 8px 6px;
+  }
+
   .stats-grid {
     grid-template-columns: 1fr;
   }
@@ -2530,14 +2420,6 @@ function appJs() {
     if ('disabled' in action) action.disabled = true;
   }
 
-  function clearActionPending(action) {
-    if (!action) return;
-    if (action.dataset.originalText) action.textContent = action.dataset.originalText;
-    action.classList.remove('text-action-running');
-    action.removeAttribute('aria-busy');
-    if ('disabled' in action) action.disabled = false;
-  }
-
   async function postJson(url, payload) {
     const response = await fetch(url, {
       method: 'POST',
@@ -2558,19 +2440,6 @@ function appJs() {
     const data = await response.json().catch(function () { return {}; });
     if (!response.ok) throw new Error(data.error || data.message || ('HTTP ' + response.status));
     return data;
-  }
-
-  async function getJson(url) {
-    const response = await fetch(url, { cache: 'no-store' });
-    const data = await response.json().catch(function () { return {}; });
-    if (!response.ok) throw new Error(data.error || data.message || ('HTTP ' + response.status));
-    return data;
-  }
-
-  function checkedLinkIds() {
-    return Array.from(document.querySelectorAll('[data-link-check]:checked')).map(function (input) {
-      return input.value;
-    }).filter(Boolean);
   }
 
   function listFromCsv(value) {
@@ -2616,27 +2485,13 @@ function appJs() {
   }
 
   function updateSelectionState() {
-    const button = document.querySelector('[data-run-selected]');
     const sellerButton = document.querySelector('[data-run-selected-sellers]');
-    const checkAll = document.querySelector('[data-check-all]');
     const checkAllSellers = document.querySelector('[data-check-all-sellers]');
-    const count = checkedLinkIds().length;
-    if (button) {
-      button.disabled = count === 0;
-      const text = button.querySelector('span');
-      if (text) text.textContent = count ? ('爬取已勾选 links 的图片（' + count + '）') : '爬取已勾选 links 的图片';
-    }
     const sellerCount = checkedSellerIds().length;
     if (sellerButton) {
       sellerButton.disabled = sellerCount === 0;
       const text = sellerButton.querySelector('span');
       if (text) text.textContent = sellerCount ? ('爬取已勾选卖家的图片（' + sellerCount + '）') : '爬取已勾选卖家的图片';
-    }
-    if (checkAll) {
-      const visibleInputs = Array.from(document.querySelectorAll('[data-filter-target]:not([hidden]) [data-link-check]'));
-      const checkedVisible = visibleInputs.filter(function (input) { return input.checked; }).length;
-      checkAll.checked = visibleInputs.length > 0 && checkedVisible === visibleInputs.length;
-      checkAll.indeterminate = checkedVisible > 0 && checkedVisible < visibleInputs.length;
     }
     if (checkAllSellers) {
       const visibleInputs = Array.from(document.querySelectorAll('[data-filter-target]:not([hidden]) [data-seller-check]'));
@@ -2656,13 +2511,14 @@ function appJs() {
         const taskTexts = activeTasks.map(function (task) {
           const seconds = Number(task.elapsedSeconds || 0);
           const timeText = Math.floor(seconds / 60) + '分' + (seconds % 60) + '秒';
-          if (task.progress && task.progress.kind === 'download-images') {
-            return task.label + '，已爬取 ' + task.progress.done + ' / ' + task.progress.total + '，剩余 ' + task.progress.remaining + '，已运行 ' + timeText;
+          if (task.progress) {
+            const verb = task.progress.kind === 'download-images' ? '已爬取 ' : '已处理 ';
+            return task.label + '，' + verb + task.progress.done + ' / ' + task.progress.total + '，剩余 ' + task.progress.remaining + '，已运行 ' + timeText;
           }
           return task.label + '，已运行 ' + timeText;
         });
         const latestTask = activeTasks[activeTasks.length - 1];
-        const recent = latestTask.progress && latestTask.progress.kind === 'download-images'
+        const recent = latestTask.progress
           ? []
           : Array.isArray(latestTask.lastOutputLines) ? latestTask.lastOutputLines.map(compactLogLine).filter(Boolean).slice(-3) : [];
         const suffix = recent.length ? '；最近：' + recent.join(' / ') : '';
@@ -2683,22 +2539,10 @@ function appJs() {
   function setupActions() {
     if (!document.querySelector('[data-run-status]')) return;
 
-    document.querySelectorAll('[data-link-check]').forEach(function (input) {
-      input.addEventListener('change', updateSelectionState);
-    });
     document.querySelectorAll('[data-seller-check]').forEach(function (input) {
       input.addEventListener('change', updateSelectionState);
     });
 
-    const checkAll = document.querySelector('[data-check-all]');
-    if (checkAll) {
-      checkAll.addEventListener('change', function () {
-        document.querySelectorAll('[data-filter-target]:not([hidden]) [data-link-check]').forEach(function (input) {
-          input.checked = checkAll.checked;
-        });
-        updateSelectionState();
-      });
-    }
     const checkAllSellers = document.querySelector('[data-check-all-sellers]');
     if (checkAllSellers) {
       checkAllSellers.addEventListener('change', function () {
@@ -2713,7 +2557,7 @@ function appJs() {
 
     function canRunTask() {
       if (apiAvailable()) return true;
-      setStatus('本页是静态打开的；勾选和筛选可用。要启动爬虫，请双击 04_start_dashboard.bat 后用本地 dashboard 操作。', true);
+      setStatus('本页是静态打开的；请双击 04_start_dashboard.bat 后用本地 dashboard 运行任务。', true);
       return false;
     }
 
@@ -2756,93 +2600,11 @@ function appJs() {
       });
     }
 
-    document.querySelectorAll('[data-run-link]').forEach(function (button) {
-      button.addEventListener('click', async function () {
-        if (!canRunTask()) return;
-        const linkId = button.dataset.runLink;
-        setActionPending(button);
-        try {
-          setStatus('已提交：爬取 ' + linkId + ' 的图片');
-          await postJson('/api/download-images', { linkIds: [linkId], maxLinks: 1, maxImages: 60 });
-          refreshTaskStatus();
-        } catch (err) {
-          clearActionPending(button);
-          setStatus(err.message, true);
-        }
-      });
-    });
-
-    document.querySelectorAll('[data-run-seller]').forEach(function (button) {
-      button.addEventListener('click', async function () {
-        if (!canRunTask()) return;
-        const sellerId = button.dataset.runSeller;
-        const linkIds = listFromCsv(button.dataset.runSellerLinks);
-        setActionPending(button);
-        try {
-          setStatus('已提交：爬取卖家 ' + sellerId + ' 的图片');
-          await postJson('/api/download-images', { sellerIds: [sellerId], linkIds: linkIds, maxLinks: Math.max(1, linkIds.length), maxImages: 200 });
-          refreshTaskStatus();
-        } catch (err) {
-          clearActionPending(button);
-          setStatus(err.message, true);
-        }
-      });
-    });
-
-    document.querySelectorAll('[data-run-link-ocr]').forEach(function (button) {
-      button.addEventListener('click', async function () {
-        if (!canRunTask()) return;
-        const linkId = button.dataset.runLinkOcr;
-        setActionPending(button);
-        try {
-          setStatus('已提交：识别 ' + linkId + ' 的 UID');
-          await postJson('/api/ocr-uids', { linkIds: [linkId] });
-          refreshTaskStatus();
-        } catch (err) {
-          clearActionPending(button);
-          setStatus(err.message, true);
-        }
-      });
-    });
-
-    document.querySelectorAll('[data-run-seller-ocr]').forEach(function (button) {
-      button.addEventListener('click', async function () {
-        if (!canRunTask()) return;
-        const sellerId = button.dataset.runSellerOcr;
-        const linkIds = listFromCsv(button.dataset.runSellerOcrLinks);
-        setActionPending(button);
-        try {
-          setStatus('已提交：识别卖家 ' + sellerId + ' 的 UID');
-          await postJson('/api/ocr-uids', { sellerIds: [sellerId], linkIds: linkIds });
-          refreshTaskStatus();
-        } catch (err) {
-          clearActionPending(button);
-          setStatus(err.message, true);
-        }
-      });
-    });
-
     document.querySelectorAll('.actions-cell a.text-action').forEach(function (link) {
       link.addEventListener('click', function () {
         setActionPending(link, '正在跳转...');
       });
     });
-
-    const runSelected = document.querySelector('[data-run-selected]');
-    if (runSelected) {
-      runSelected.addEventListener('click', async function () {
-        if (!canRunTask()) return;
-        const linkIds = checkedLinkIds();
-        if (!linkIds.length) return;
-        try {
-          setStatus('已提交：爬取 ' + linkIds.length + ' 个 link 的图片');
-          await postJson('/api/download-images', { linkIds: linkIds, maxLinks: linkIds.length, maxImages: Math.max(60, linkIds.length * 60) });
-          refreshTaskStatus();
-        } catch (err) {
-          setStatus(err.message, true);
-        }
-      });
-    }
 
     const runSelectedSellers = document.querySelector('[data-run-selected-sellers]');
     if (runSelectedSellers) {
@@ -2853,7 +2615,7 @@ function appJs() {
         if (!sellerIds.length) return;
         try {
           setStatus('已提交：爬取 ' + sellerIds.length + ' 个卖家的图片');
-          await postJson('/api/download-images', { sellerIds: sellerIds, linkIds: linkIds, maxLinks: Math.max(1, linkIds.length), maxImages: Math.max(200, sellerIds.length * 120) });
+          await postJson('/api/download-images', { sellerIds: sellerIds, linkIds: linkIds, maxLinks: Math.max(1, linkIds.length), maxImages: Math.max(500, sellerIds.length * 500) });
           refreshTaskStatus();
         } catch (err) {
           setStatus(err.message, true);
@@ -2947,15 +2709,8 @@ function appJs() {
   }
 
   function setupImageCsvDownloadLink() {
-    const toolbar = document.querySelector('.gallery') ? document.querySelector('.toolbar') : null;
-    if (!toolbar || !document.querySelector('[data-image-row]')) return;
-    if (toolbar.querySelector('[data-download-image-csv]')) return;
-    const link = document.createElement('a');
-    link.className = 'text-action toolbar-action';
-    link.href = 'image_uid_export.csv';
-    link.download = 'image_uid_filtered_export.csv';
-    link.dataset.downloadImageCsv = '1';
-    link.textContent = '下载 CSV';
+    const link = document.querySelector('[data-download-image-csv]');
+    if (!link) return;
     link.addEventListener('click', function (event) {
       event.preventDefault();
       const search = document.querySelector('[data-filter-search]');
@@ -3007,46 +2762,8 @@ function appJs() {
       temp.click();
       temp.remove();
       URL.revokeObjectURL(url);
+      setStatus('已导出当前筛选结果：' + rows.length + ' 张图片。');
     });
-    toolbar.insertBefore(link, toolbar.firstChild);
-  }
-
-  function setupNoUidCleanupButton() {
-    const toolbar = document.querySelector('.gallery') ? document.querySelector('.toolbar') : null;
-    if (!toolbar || !document.querySelector('[data-image-row]')) return;
-    if (toolbar.querySelector('[data-cleanup-no-uid-images]')) return;
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'text-action toolbar-action danger-action';
-    button.dataset.cleanupNoUidImages = '1';
-    button.textContent = '清理无 UID 图片';
-    button.addEventListener('click', async function () {
-      if (!apiAvailable()) {
-        setStatus('本页是静态打开的；请双击 04_start_dashboard.bat 后用本地 dashboard 清理。', true);
-        return;
-      }
-      try {
-        setActionPending(button, '正在预估...');
-        const preview = await postJson('/api/cleanup/no-uid-images', { dryRun: true });
-        clearActionPending(button);
-        if (!preview.count) {
-          setStatus('没有可清理的无 UID 图片。');
-          return;
-        }
-        setStatus('可清理 ' + preview.count + ' 张无 UID 图片，预计释放 ' + preview.mb + ' MB。');
-        const ok = window.confirm('将清理 ' + preview.count + ' 张无 UID 图片，预计释放 ' + preview.mb + ' MB。记录会保留，后续不会重复下载这些图片。确认继续？');
-        if (!ok) return;
-        setActionPending(button);
-        await postJson('/api/cleanup/no-uid-images');
-        clearActionPending(button);
-        setStatus('已提交清理任务：' + preview.count + ' 张无 UID 图片。');
-        refreshTaskStatus();
-      } catch (err) {
-        clearActionPending(button);
-        setStatus(err.message, true);
-      }
-    });
-    toolbar.insertBefore(button, toolbar.firstChild);
   }
 
   function setupImageConfidenceFilter() {
@@ -3257,7 +2974,6 @@ function appJs() {
 
   setupImageConfidenceFilter();
   setupImageUidFilter();
-  setupNoUidCleanupButton();
   setupImageCsvDownloadLink();
   setupFilters();
   setupActions();
@@ -3274,11 +2990,11 @@ function indexHtml() {
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="refresh" content="0; url=sellers.html">
+  <meta http-equiv="refresh" content="0; url=keywords.html">
   <title>Xianyu Review Image Index</title>
 </head>
 <body>
-  <a href="sellers.html">打开卖家页面</a>
+  <a href="keywords.html">打开关键词页面</a>
 </body>
 </html>
 `;
@@ -3299,13 +3015,13 @@ async function main() {
 
   await fs.mkdir(ASSETS_DIR, { recursive: true });
   await Promise.all([
-    fs.writeFile(path.join(SITE_DIR, 'sellers.html'), renderSellersPage(sellers, keywords, generatedAt), 'utf8'),
-    fs.writeFile(path.join(SITE_DIR, 'links.html'), renderLinksPage(links, imagesByLink, keywords, keywordByText, generatedAt), 'utf8'),
-    fs.writeFile(path.join(SITE_DIR, 'images.html'), renderImagesPage(links, images, imagesBySeller, keywords, keywordByText, generatedAt), 'utf8'),
-    fs.writeFile(path.join(SITE_DIR, 'keywords.html'), renderKeywordsPage(keywords, links, images, generatedAt), 'utf8'),
-    fs.writeFile(path.join(SITE_DIR, 'index.html'), indexHtml(), 'utf8'),
-    fs.writeFile(path.join(ASSETS_DIR, 'app.css'), css(), 'utf8'),
-    fs.writeFile(path.join(ASSETS_DIR, 'app.js'), appJs(), 'utf8'),
+    writeFileAtomic(path.join(SITE_DIR, 'sellers.html'), renderSellersPage(sellers, keywords, generatedAt), 'utf8'),
+    writeFileAtomic(path.join(SITE_DIR, 'links.html'), renderLinksPage(links, imagesByLink, keywords, keywordByText, generatedAt), 'utf8'),
+    writeFileAtomic(path.join(SITE_DIR, 'images.html'), renderImagesPage(links, images, imagesBySeller, keywords, keywordByText, generatedAt), 'utf8'),
+    writeFileAtomic(path.join(SITE_DIR, 'keywords.html'), renderKeywordsPage(keywords, links, images, generatedAt), 'utf8'),
+    writeFileAtomic(path.join(SITE_DIR, 'index.html'), indexHtml(), 'utf8'),
+    writeFileAtomic(path.join(ASSETS_DIR, 'app.css'), css(), 'utf8'),
+    writeFileAtomic(path.join(ASSETS_DIR, 'app.js'), appJs(), 'utf8'),
     writeImageUidExport(images),
   ]);
 
@@ -3316,7 +3032,14 @@ async function main() {
   console.log(`Keywords: ${keywords.length}`);
 }
 
-main().catch((err) => {
-  console.error(err && err.stack ? err.stack : err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err && err.stack ? err.stack : err);
+    process.exit(1);
+  });
+} else {
+  module.exports = {
+    effectiveHasImages,
+    linkProgress,
+  };
+}

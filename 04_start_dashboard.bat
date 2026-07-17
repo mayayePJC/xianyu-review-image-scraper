@@ -6,7 +6,7 @@ cd /d "%~dp0"
 
 set "NODE_EXE=C:\Program Files\nodejs\node.exe"
 if not exist "%NODE_EXE%" (
-  set "NODE_EXE=C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe"
+  set "NODE_EXE=%USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe"
 )
 
 if not exist "%NODE_EXE%" (
@@ -21,13 +21,13 @@ echo Xianyu local dashboard
 echo ========================================
 echo.
 echo URL:
-echo   http://127.0.0.1:8788/sellers.html
+echo   http://127.0.0.1:8788/keywords.html
 echo.
 echo Close this window to stop the dashboard server.
 echo.
 
 set "XIANYU_DASHBOARD_PORT=8788"
-start "" "http://127.0.0.1:8788/sellers.html"
+start "" "http://127.0.0.1:8788/keywords.html"
 "%NODE_EXE%" "_internal\dashboard_server.cjs"
 
 set "EXIT_CODE=%ERRORLEVEL%"

@@ -4,8 +4,10 @@
 const http = require('http');
 const fsSync = require('fs');
 const fs = require('fs/promises');
+const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
+const { readCsvRows, writeCsvRows, writeFileAtomic } = require('./csv_utils.cjs');
 
 const INTERNAL_DIR = __dirname;
 const ROOT_DIR = path.basename(INTERNAL_DIR).toLowerCase() === '_internal' ? path.resolve(INTERNAL_DIR, '..') : INTERNAL_DIR;
@@ -19,22 +21,25 @@ const LOCAL_DEFAULTS_FILE = path.join(ROOT_DIR, 'config', 'xianyu_local_defaults
 const KEYWORD_HEADERS = ['keyword', 'keyword_type', 'game_name', 'created_at', 'updated_at', 'notes'];
 const LINK_HEADERS = ['link_id', 'keyword', 'item_url', 'seller_url', 'review_url', 'seller_name', 'item_title', 'card_text', 'has_images', 'total_images', 'images_downloaded', 'images_remaining', 'link_status', 'image_status', 'last_link_crawl_at', 'last_image_crawl_at', 'notes'];
 const IMAGE_HEADERS = ['image_id', 'seller_id', 'link_id', 'keyword', 'seller_url', 'review_url', 'thumb_url', 'original_url', 'local_path', 'source', 'width', 'height', 'content_type', 'bytes', 'sha256', 'status', 'downloaded_at', 'notes', 'uid', 'usable'];
+const MAX_LINKS_PER_TASK = 2000;
+const MAX_IMAGES_PER_TASK = 100000;
 function loadLocalDefaults() {
   try {
     const raw = fsSync.readFileSync(LOCAL_DEFAULTS_FILE, 'utf8');
     const parsed = JSON.parse(raw.replace(/^\uFEFF/, ''));
     return parsed && typeof parsed === 'object' ? parsed : {};
-  } catch {
-    return {};
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return {};
+    throw new Error(`Cannot read local defaults: ${LOCAL_DEFAULTS_FILE}: ${error.message || String(error)}`);
   }
 }
 const LOCAL_DEFAULTS = loadLocalDefaults();
 const DEFAULT_KEYWORD_TYPE = String(LOCAL_DEFAULTS.keyword_type || LOCAL_DEFAULTS.keywordType || 'general').trim() || 'general';
 const DEFAULT_GAME_NAME = String(LOCAL_DEFAULTS.game_name || LOCAL_DEFAULTS.gameName || 'default').trim() || 'default';
-const PORT = Number(process.env.XIANYU_DASHBOARD_PORT || 8787);
+const PORT = Number(process.env.XIANYU_DASHBOARD_PORT || 8788);
 const NODE_EXE = process.execPath;
 const BUNDLED_PYTHON_EXE = path.join(
-  process.env.USERPROFILE || 'C:\\Users\\Administrator',
+  process.env.USERPROFILE || os.homedir(),
   '.cache',
   'codex-runtimes',
   'codex-primary-runtime',
@@ -48,6 +53,7 @@ const runningTasks = new Map();
 const taskHistory = [];
 let lastLiveRegenerateAt = 0;
 let liveRegenerateRunning = false;
+let taskSequence = 0;
 
 function jsonResponse(res, status, payload) {
   res.writeHead(status, {
@@ -83,73 +89,6 @@ function sanitizeKeywords(value) {
     .filter((item) => item.length <= 120))].slice(0, 30);
 }
 
-function csvEscape(value) {
-  const s = String(value ?? '');
-  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-}
-
-function parseCsv(raw) {
-  const text = String(raw || '').replace(/^\uFEFF/, '');
-  const records = [];
-  let row = [];
-  let cell = '';
-  let quoted = false;
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i];
-    if (quoted) {
-      if (ch === '"' && text[i + 1] === '"') {
-        cell += '"';
-        i += 1;
-      } else if (ch === '"') {
-        quoted = false;
-      } else {
-        cell += ch;
-      }
-    } else if (ch === '"') {
-      quoted = true;
-    } else if (ch === ',') {
-      row.push(cell);
-      cell = '';
-    } else if (ch === '\n' || ch === '\r') {
-      if (ch === '\r' && text[i + 1] === '\n') i += 1;
-      row.push(cell);
-      records.push(row);
-      row = [];
-      cell = '';
-    } else {
-      cell += ch;
-    }
-  }
-  if (cell.length || row.length) {
-    row.push(cell);
-    records.push(row);
-  }
-  if (!records.length) return [];
-  const headers = records[0].map((header) => String(header || '').trim());
-  return records.slice(1).filter((record) => record.some((value) => String(value || '').length)).map((record) => {
-    const out = {};
-    headers.forEach((header, index) => {
-      out[header] = record[index] ?? '';
-    });
-    return out;
-  });
-}
-
-async function readCsvRows(file) {
-  try {
-    return parseCsv(await fs.readFile(file, 'utf8'));
-  } catch (err) {
-    if (err && err.code === 'ENOENT') return [];
-    throw err;
-  }
-}
-
-async function writeCsvRows(file, headers, rows) {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  const body = [headers.join(','), ...rows.map((row) => headers.map((header) => csvEscape(row[header] ?? '')).join(','))].join('\r\n');
-  await fs.writeFile(file, `${body}\r\n`, 'utf8');
-}
-
 async function readKeywordConfig() {
   try {
     const raw = await fs.readFile(KEYWORD_CONFIG_FILE, 'utf8');
@@ -163,7 +102,7 @@ async function readKeywordConfig() {
 async function syncKeywordConfig(rows) {
   const keywords = [...new Set(rows.map((row) => String(row.keyword || '').trim()).filter(Boolean))];
   await fs.mkdir(path.dirname(KEYWORD_CONFIG_FILE), { recursive: true });
-  await fs.writeFile(KEYWORD_CONFIG_FILE, `${keywords.join('\r\n')}\r\n`, 'utf8');
+  await writeFileAtomic(KEYWORD_CONFIG_FILE, `${keywords.join('\r\n')}\r\n`, 'utf8');
 }
 
 async function ensureKeywordState() {
@@ -212,18 +151,21 @@ async function linkIdsForKeywords(keywords) {
     .filter(Boolean))];
 }
 
-async function keywordsForFilters(keywordType, gameName, submittedKeywords) {
+function filterKeywordRows(rows, keywordType, gameName, submittedKeywords) {
   const type = String(keywordType || '').trim();
   const game = String(gameName || '').trim();
   const submitted = new Set(submittedKeywords.map((keyword) => String(keyword || '').trim().toLowerCase()).filter(Boolean));
   if (!type && !game) return submittedKeywords;
-  const rows = await ensureKeywordState();
   return rows
     .filter((row) => !type || String(row.keyword_type || '').trim() === type)
     .filter((row) => !game || String(row.game_name || '').trim() === game)
     .map((row) => String(row.keyword || '').trim())
     .filter(Boolean)
     .filter((keyword) => !submitted.size || submitted.has(keyword.toLowerCase()));
+}
+
+async function keywordsForFilters(keywordType, gameName, submittedKeywords) {
+  return filterKeywordRows(await ensureKeywordState(), keywordType, gameName, submittedKeywords);
 }
 
 async function linkCountsByKeyword() {
@@ -238,12 +180,16 @@ async function linkCountsByKeyword() {
   return counts;
 }
 
+function isPathInside(rootPath, candidatePath) {
+  const relative = path.relative(path.resolve(rootPath), path.resolve(candidatePath));
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
 function resolveLocalDataPath(raw) {
   const text = String(raw || '').trim();
   if (!text) return '';
   const absolute = path.isAbsolute(text) ? text : path.resolve(ROOT_DIR, text);
-  const root = path.resolve(ROOT_DIR);
-  return absolute.startsWith(root) ? absolute : '';
+  return isPathInside(ROOT_DIR, absolute) ? absolute : '';
 }
 
 function isNoUidCleanupCandidate(row) {
@@ -286,29 +232,62 @@ async function cleanupNoUidImages({ dryRun = true } = {}) {
   return { count, bytes, mb: Math.round((bytes / 1024 / 1024) * 100) / 100 };
 }
 
-async function deleteKeywordRelatedData(keyword) {
+function planKeywordRelatedDeletion(keyword, linkRows, imageRows) {
   const key = String(keyword || '').trim().toLowerCase();
-  if (!key) return { links: 0, images: 0, files: 0, bytes: 0, mb: 0 };
-
-  const linkRows = await readCsvRows(LINK_STATE_FILE);
+  if (!key) return { keptLinks: [...linkRows], deletedLinks: [], keptImages: [...imageRows], deletedImages: [], rehomedImages: 0 };
   const deletedLinks = linkRows.filter((row) => String(row.keyword || '').trim().toLowerCase() === key);
   const deletedLinkIds = new Set(deletedLinks.map((row) => String(row.link_id || '').trim()).filter(Boolean));
   const keptLinks = linkRows.filter((row) => String(row.keyword || '').trim().toLowerCase() !== key);
+  const keptLinkBySeller = new Map();
+  for (const row of keptLinks) {
+    const sellerId = sellerIdFromLink(row);
+    if (sellerId && !keptLinkBySeller.has(sellerId)) keptLinkBySeller.set(sellerId, row);
+  }
+  const deletedSellerIds = new Set(deletedLinks.map(sellerIdFromLink).filter(Boolean));
+  const exclusiveSellerIds = new Set([...deletedSellerIds].filter((sellerId) => !keptLinkBySeller.has(sellerId)));
 
-  const imageRows = await readCsvRows(IMAGE_STATE_FILE);
   const keptImages = [];
-  let images = 0;
-  let files = 0;
-  let bytes = 0;
-  for (const row of imageRows) {
-    const imageKeyword = String(row.keyword || '').trim().toLowerCase();
-    const imageLinkId = String(row.link_id || '').trim();
-    const shouldDelete = imageKeyword === key || (imageLinkId && deletedLinkIds.has(imageLinkId));
-    if (!shouldDelete) {
-      keptImages.push(row);
+  const deletedImages = [];
+  let rehomedImages = 0;
+  for (const originalRow of imageRows) {
+    const sellerId = sellerIdFromLink(originalRow);
+    const imageKeyword = String(originalRow.keyword || '').trim().toLowerCase();
+    const imageLinkId = String(originalRow.link_id || '').trim();
+    const directlyRelated = imageKeyword === key || (imageLinkId && deletedLinkIds.has(imageLinkId));
+    if (sellerId && exclusiveSellerIds.has(sellerId)) {
+      deletedImages.push(originalRow);
       continue;
     }
-    images += 1;
+    const replacement = sellerId ? keptLinkBySeller.get(sellerId) : null;
+    if (directlyRelated && replacement) {
+      keptImages.push({
+        ...originalRow,
+        link_id: replacement.link_id || originalRow.link_id,
+        keyword: replacement.keyword || originalRow.keyword,
+        seller_url: replacement.seller_url || originalRow.seller_url,
+        review_url: replacement.review_url || originalRow.review_url,
+      });
+      rehomedImages += 1;
+      continue;
+    }
+    if (directlyRelated) deletedImages.push(originalRow);
+    else keptImages.push(originalRow);
+  }
+
+  return { keptLinks, deletedLinks, keptImages, deletedImages, rehomedImages };
+}
+
+async function deleteKeywordRelatedData(keyword) {
+  const key = String(keyword || '').trim().toLowerCase();
+  if (!key) return { links: 0, images: 0, files: 0, bytes: 0, mb: 0, rehomedImages: 0 };
+
+  const linkRows = await readCsvRows(LINK_STATE_FILE);
+  const imageRows = await readCsvRows(IMAGE_STATE_FILE);
+  const plan = planKeywordRelatedDeletion(key, linkRows, imageRows);
+
+  let files = 0;
+  let bytes = 0;
+  for (const row of plan.deletedImages) {
     const localPath = resolveLocalDataPath(row.local_path);
     if (!localPath || !fsSync.existsSync(localPath)) continue;
     try {
@@ -321,14 +300,15 @@ async function deleteKeywordRelatedData(keyword) {
     }
   }
 
-  await writeCsvRows(LINK_STATE_FILE, LINK_HEADERS, keptLinks);
-  await writeCsvRows(IMAGE_STATE_FILE, IMAGE_HEADERS, keptImages);
+  await writeCsvRows(LINK_STATE_FILE, LINK_HEADERS, plan.keptLinks);
+  await writeCsvRows(IMAGE_STATE_FILE, IMAGE_HEADERS, plan.keptImages);
   return {
-    links: deletedLinks.length,
-    images,
+    links: plan.deletedLinks.length,
+    images: plan.deletedImages.length,
     files,
     bytes,
     mb: Math.round((bytes / 1024 / 1024) * 100) / 100,
+    rehomedImages: plan.rehomedImages,
   };
 }
 
@@ -396,15 +376,26 @@ function taskSnapshot() {
 }
 
 function taskProgress(task) {
-  if (!task || !task.progressTotal) return null;
+  if (!task) return null;
   let done = Number(task.progressDone || 0);
-  if (task.progressKind === 'download-images') {
-    const matches = String(task.output || '').match(/== Download review images:/g);
+  let total = Number(task.progressTotal || 0);
+  let kind = task.progressKind || '';
+  const output = String(task.output || '');
+  const progressPattern = /TASK_PROGRESS\s+([a-z-]+)\s+done=(\d+)\s+total=(\d+)/g;
+  let marker;
+  let latestMarker = null;
+  while ((marker = progressPattern.exec(output))) latestMarker = marker;
+  if (latestMarker) {
+    kind = latestMarker[1] || kind;
+    done = Math.max(done, Number(latestMarker[2] || 0));
+    total = Number(latestMarker[3] || total);
+  } else if (kind === 'download-images') {
+    const matches = output.match(/== Download review images:/g);
     done = Math.max(done, matches ? matches.length : 0);
   }
-  const total = Number(task.progressTotal || 0);
+  if (!kind && !total) return null;
   return {
-    kind: task.progressKind || '',
+    kind,
     done: Math.min(done, total),
     total,
     remaining: Math.max(0, total - done),
@@ -443,10 +434,31 @@ function runNodeScript(script, args, label, task) {
       else {
         const err = new Error(`${label} exited with code ${code}`);
         err.output = output.join('');
+        err.outputAlreadyAppended = Boolean(task);
         reject(err);
       }
     });
   });
+}
+
+function isRetryableBrowserFailure(error) {
+  const text = `${error?.message || ''}\n${error?.output || ''}\n${error?.stack || ''}`;
+  return /Target page, context or browser has been closed|Target\.createTarget.*Failed to open a new tab|browserContext\.newPage.*closed|Browser closed|Target closed|page has been closed|context has been closed/i.test(text);
+}
+
+async function runBrowserNodeScript(script, args, label, task, maxAttempts = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await runNodeScript(script, args, label, task);
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableBrowserFailure(error) || attempt >= maxAttempts) throw error;
+      appendTaskOutput(task, `\nBrowser session stopped unexpectedly; retrying from saved progress (${attempt + 1}/${maxAttempts}).\n`);
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+  }
+  throw lastError;
 }
 
 function runPythonScript(script, args, label, task) {
@@ -459,6 +471,7 @@ function runPythonScript(script, args, label, task) {
         ...process.env,
         PYTHONDONTWRITEBYTECODE: '1',
         PYTHONPYCACHEPREFIX: path.join(INTERNAL_DIR, 'tmp_pycache'),
+        PYTHONUNBUFFERED: '1',
       },
     });
     const output = [];
@@ -480,6 +493,7 @@ function runPythonScript(script, args, label, task) {
       else {
         const err = new Error(`${label} exited with code ${code}`);
         err.output = output.join('');
+        err.outputAlreadyAppended = Boolean(task);
         reject(err);
       }
     });
@@ -515,13 +529,13 @@ function taskConflicts(locks) {
   return null;
 }
 
-async function enqueueTask(label, locks, worker) {
+function reserveTask(label, locks) {
   const conflict = taskConflicts(locks);
   if (conflict) {
     return { accepted: false, status: 409, message: `已有任务正在运行：${conflict.label}` };
   }
   const task = {
-    id: `${Date.now()}`,
+    id: `${Date.now()}_${taskSequence += 1}`,
     label,
     locks: locks || ['browser'],
     status: 'running',
@@ -531,23 +545,71 @@ async function enqueueTask(label, locks, worker) {
     error: '',
   };
   runningTasks.set(task.id, task);
-  setImmediate(async () => {
-    try {
-      await worker(task);
-      await regenerateSite();
-      task.status = 'done';
-    } catch (err) {
-      task.status = 'failed';
-      task.error = err && err.message ? err.message : String(err);
-      if (err && err.output) task.output = `${task.output || ''}${err.output}`.slice(-16000);
-    } finally {
-      task.finishedAt = nowIso();
-      taskHistory.push({ ...task });
-      if (taskHistory.length > 20) taskHistory.shift();
-      runningTasks.delete(task.id);
+  return { accepted: true, task };
+}
+
+async function executeReservedTask(task, worker) {
+  let value;
+  let failure = null;
+  try {
+    value = await worker(task);
+  } catch (error) {
+    failure = error;
+    task.status = 'failed';
+    task.error = error && error.message ? error.message : String(error);
+    if (error && error.output && !error.outputAlreadyAppended) {
+      task.output = `${task.output || ''}${error.output}`.slice(-16000);
     }
+  }
+  try {
+    await regenerateSite();
+  } catch (error) {
+    appendTaskOutput(task, `\nSite regeneration failed: ${error.message || String(error)}\n`);
+    if (!failure) {
+      failure = error;
+      task.status = 'failed';
+      task.error = error && error.message ? error.message : String(error);
+    }
+  } finally {
+    if (!failure) task.status = 'done';
+    task.finishedAt = nowIso();
+    taskHistory.push({ ...task });
+    if (taskHistory.length > 20) taskHistory.shift();
+    runningTasks.delete(task.id);
+  }
+  return { ok: !failure, value, error: failure, task };
+}
+
+async function enqueueTask(label, locks, worker) {
+  const reservation = reserveTask(label, locks);
+  if (!reservation.accepted) return reservation;
+  const { task } = reservation;
+  setImmediate(() => {
+    executeReservedTask(task, worker).catch((error) => {
+      console.error(`Task finalization failed: ${error.message || String(error)}`);
+    });
   });
   return { accepted: true, task };
+}
+
+async function runTaskAndWait(label, locks, worker) {
+  const reservation = reserveTask(label, locks);
+  if (!reservation.accepted) return reservation;
+  const execution = await executeReservedTask(reservation.task, worker);
+  if (!execution.ok) {
+    return {
+      accepted: false,
+      status: Number(execution.error?.status) || 500,
+      error: execution.task.error,
+      task: execution.task,
+    };
+  }
+  return {
+    accepted: true,
+    status: 200,
+    task: execution.task,
+    value: execution.value,
+  };
 }
 
 async function readRequestBody(req) {
@@ -584,19 +646,28 @@ async function handleApi(req, res, url) {
       jsonResponse(res, 400, { error: 'keyword required' });
       return;
     }
-    const rows = await ensureKeywordState();
-    const kept = rows.filter((row) => String(row.keyword || '').trim().toLowerCase() !== keyword.toLowerCase());
-    if (kept.length === rows.length && !deleteRelated) {
-      jsonResponse(res, 404, { error: 'keyword not found' });
+    const result = await runTaskAndWait(`删除关键词：${keyword}`, ['browser', 'images', 'ocr', 'site'], async () => {
+      const rows = await ensureKeywordState();
+      const kept = rows.filter((row) => String(row.keyword || '').trim().toLowerCase() !== keyword.toLowerCase());
+      if (kept.length === rows.length && !deleteRelated) {
+        const error = new Error('keyword not found');
+        error.status = 404;
+        throw error;
+      }
+      if (kept.length !== rows.length) {
+        await writeCsvRows(KEYWORD_STATE_FILE, KEYWORD_HEADERS, kept);
+        await syncKeywordConfig(kept);
+      }
+      const deleted = deleteRelated
+        ? await deleteKeywordRelatedData(keyword)
+        : { links: 0, images: 0, files: 0, bytes: 0, mb: 0, rehomedImages: 0 };
+      return { ok: true, keyword, keywords: kept.length, deleteRelated, deleted };
+    });
+    if (!result.accepted) {
+      jsonResponse(res, result.status || 409, { error: result.message || result.error || 'task rejected' });
       return;
     }
-    if (kept.length !== rows.length) {
-      await writeCsvRows(KEYWORD_STATE_FILE, KEYWORD_HEADERS, kept);
-      await syncKeywordConfig(kept);
-    }
-    const deleted = deleteRelated ? await deleteKeywordRelatedData(keyword) : { links: 0, images: 0, files: 0, bytes: 0, mb: 0 };
-    await regenerateSite();
-    jsonResponse(res, 200, { ok: true, keyword, keywords: kept.length, deleteRelated, deleted });
+    jsonResponse(res, 200, result.value);
     return;
   }
 
@@ -618,28 +689,34 @@ async function handleApi(req, res, url) {
       jsonResponse(res, 400, { error: 'keyword, keywordType or gameName too long' });
       return;
     }
-    const rows = await ensureKeywordState();
-    const now = nowIso();
-    const existing = rows.find((row) => String(row.keyword || '').trim().toLowerCase() === keyword.toLowerCase());
-    if (existing) {
-      existing.keyword_type = keywordType;
-      existing.game_name = gameName;
-      existing.updated_at = now;
-      existing.notes = existing.notes || '';
-    } else {
-      rows.push({
-        keyword,
-        keyword_type: keywordType,
-        game_name: gameName,
-        created_at: now,
-        updated_at: now,
-        notes: 'added from dashboard',
-      });
+    const result = await runTaskAndWait(`保存关键词：${keyword}`, ['site'], async () => {
+      const rows = await ensureKeywordState();
+      const now = nowIso();
+      const existing = rows.find((row) => String(row.keyword || '').trim().toLowerCase() === keyword.toLowerCase());
+      if (existing) {
+        existing.keyword_type = keywordType;
+        existing.game_name = gameName;
+        existing.updated_at = now;
+        existing.notes = existing.notes || '';
+      } else {
+        rows.push({
+          keyword,
+          keyword_type: keywordType,
+          game_name: gameName,
+          created_at: now,
+          updated_at: now,
+          notes: 'added from dashboard',
+        });
+      }
+      await writeCsvRows(KEYWORD_STATE_FILE, KEYWORD_HEADERS, rows);
+      await syncKeywordConfig(rows);
+      return { ok: true, keyword, keywordType, gameName, keywords: rows.length };
+    });
+    if (!result.accepted) {
+      jsonResponse(res, result.status || 409, { error: result.message || result.error || 'task rejected' });
+      return;
     }
-    await writeCsvRows(KEYWORD_STATE_FILE, KEYWORD_HEADERS, rows);
-    await syncKeywordConfig(rows);
-    await regenerateSite();
-    jsonResponse(res, 200, { ok: true, keyword, keywordType, gameName, keywords: rows.length });
+    jsonResponse(res, 200, result.value);
     return;
   }
 
@@ -679,7 +756,7 @@ async function handleApi(req, res, url) {
     if (keywords.length) args.push('--keywords', keywords.join('|'));
     const labelKeywords = keywords.slice(0, 3).join('、') + (keywords.length > 3 ? ` 等 ${keywords.length} 个` : '');
     const result = await enqueueTask(`抓筛选关键词：${labelKeywords}`, ['browser'], async (task) => {
-      await runNodeScript('xianyu_public_review_image_scraper.cjs', args, 'discover links', task);
+      await runBrowserNodeScript('xianyu_public_review_image_scraper.cjs', args, 'discover links', task);
     });
     jsonResponse(res, result.status || 202, result);
     return;
@@ -697,14 +774,22 @@ async function handleApi(req, res, url) {
       return;
     }
     const maxLinksRaw = body.maxSellers || body.maxLinks || linkIds.length;
-    const maxLinks = Math.max(1, Math.min(100, Number(maxLinksRaw) || linkIds.length));
-    const maxImages = Math.max(1, Math.min(1000, Number(body.maxImages || Math.max(30, linkIds.length * 30)) || 30));
-    const label = sellerIds.length ? `爬取图片：${sellerIds.length} 个卖家` : `爬取图片：${linkIds.length} 个 link`;
+    const maxLinks = Math.max(1, Math.floor(Number(maxLinksRaw) || linkIds.length));
+    const selectedCount = sellerIds.length || linkIds.length;
+    const maxImagesRaw = body.maxImages || Math.max(500, selectedCount * 500);
+    const maxImages = Math.max(1, Math.floor(Number(maxImagesRaw) || 500));
+    if (maxLinks > MAX_LINKS_PER_TASK || maxImages > MAX_IMAGES_PER_TASK) {
+      jsonResponse(res, 400, {
+        error: `单次任务最多 ${MAX_LINKS_PER_TASK} 个卖家/link、${MAX_IMAGES_PER_TASK} 张图片；当前请求 ${maxLinks} / ${maxImages}`,
+      });
+      return;
+    }
+    const label = sellerIds.length ? `爬取图片：已选 ${sellerIds.length} 个卖家` : `爬取图片：已选 ${linkIds.length} 个 link`;
     const result = await enqueueTask(label, ['browser', 'images'], async (task) => {
       task.progressKind = 'download-images';
-      task.progressTotal = maxLinks;
+      task.progressTotal = Math.min(selectedCount, maxLinks);
       task.progressUnit = sellerIds.length ? '个卖家' : '个 link';
-      await runNodeScript('xianyu_public_review_image_scraper.cjs', [
+      await runBrowserNodeScript('xianyu_public_review_image_scraper.cjs', [
         '--mode', 'download-images',
         '--cdp-url=',
         '--link-ids', linkIds.join(','),
@@ -723,7 +808,7 @@ async function handleApi(req, res, url) {
     const body = await readRequestBody(req);
     const maxSellers = Math.max(1, Math.min(100, Number(body.maxSellers || 30) || 30));
     const result = await enqueueTask(`补卖家名：最多 ${maxSellers} 个卖家`, ['browser'], async (task) => {
-      await runNodeScript('xianyu_public_review_image_scraper.cjs', [
+      await runBrowserNodeScript('xianyu_public_review_image_scraper.cjs', [
         '--mode', 'refresh-seller-names',
         '--cdp-url=',
         '--max-seller-names-per-run', String(maxSellers),
@@ -737,7 +822,7 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === '/api/regenerate-site') {
-    const result = await enqueueTask('刷新 HTML 页面', ['browser', 'images', 'ocr', 'site'], regenerateSite);
+    const result = await enqueueTask('刷新 HTML 页面', ['browser', 'images', 'ocr', 'site'], async () => {});
     jsonResponse(res, result.status || 202, result);
     return;
   }
@@ -752,6 +837,8 @@ async function handleApi(req, res, url) {
     const args = linkIds.length ? ['--link-ids', linkIds.join(',')] : [];
     const label = sellerIds.length ? `OCR UID：${sellerIds.length} 个卖家` : linkIds.length ? `OCR UID：${linkIds.length} 个 link` : 'OCR UID';
     const result = await enqueueTask(label, ['ocr', 'images'], async (task) => {
+      task.progressKind = 'ocr-uids';
+      task.progressUnit = '张';
       await runPythonScript('ocr_uid_from_images.py', args, 'ocr uid images', task);
     });
     jsonResponse(res, result.status || 202, result);
@@ -782,11 +869,11 @@ async function handleApi(req, res, url) {
 
 async function serveStatic(req, res, url) {
   let requested = decodeURIComponent(url.pathname);
-  if (requested === '/') requested = '/sellers.html';
+  if (requested === '/') requested = '/keywords.html';
   const cleanRequest = requested.replace(/^\/+/, '');
   const root = cleanRequest.startsWith('images/') ? ROOT_DIR : SITE_DIR;
   const filePath = path.resolve(root, cleanRequest);
-  if (!filePath.startsWith(root)) {
+  if (!isPathInside(root, filePath)) {
     textResponse(res, 403, 'Forbidden');
     return;
   }
@@ -825,12 +912,22 @@ async function start() {
     }
   });
   server.listen(PORT, '127.0.0.1', () => {
-    console.log(`Dashboard: http://127.0.0.1:${PORT}/links.html`);
+    console.log(`Dashboard: http://127.0.0.1:${PORT}/keywords.html`);
     console.log('Close this window to stop the dashboard server.');
   });
 }
 
-start().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (require.main === module) {
+  start().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+} else {
+  module.exports = {
+    filterKeywordRows,
+    isPathInside,
+    isRetryableBrowserFailure,
+    planKeywordRelatedDeletion,
+    taskProgress,
+  };
+}

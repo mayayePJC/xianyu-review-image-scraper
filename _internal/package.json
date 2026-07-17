@@ -8,7 +8,7 @@
     "download:images": "node xianyu_public_review_image_scraper.cjs --mode download-images",
     "site": "node generate_site.cjs",
     "dashboard": "node dashboard_server.cjs",
-    "test": "node test_page_management.cjs"
+    "test": "node generate_site.cjs && node test_site_workflow.cjs && node test_page_management.cjs && node test_data_safety.cjs && node test_dashboard_logic.cjs && python -B test_ocr_logic.py"
   },
   "dependencies": {
     "playwright-core": "latest"

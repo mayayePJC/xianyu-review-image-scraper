@@ -5,6 +5,7 @@ const fs = require('fs/promises');
 const fsSync = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { csvEscape, readCsvRows, writeCsvRows } = require('./csv_utils.cjs');
 
 const DEFAULTS = {
   mode: 'discover-links',
@@ -142,11 +143,53 @@ function nowIso() {
 }
 
 function hasImagesStatus(row) {
-  return String(row?.has_images || '').trim().toLowerCase();
+  const value = String(row?.has_images || '').trim().toLowerCase();
+  if (value === 'no' && !isConfirmedNoImagesRow(row)) return '';
+  return value;
 }
 
 function imageStatus(row) {
   return String(row?.image_status || '').trim().toLowerCase();
+}
+
+function isConfirmedNoImagesRow(row) {
+  return [row?.link_status, row?.image_status]
+    .map((value) => String(value || '').trim().toLowerCase())
+    .includes('confirmed_no_images');
+}
+
+function classifyImageInspection(navigationStatus, imageCount = 0) {
+  const status = String(navigationStatus || '').trim();
+  const count = Math.max(0, Number(imageCount) || 0);
+  if (status === 'with_pictures_not_found') {
+    return { status: 'confirmed_no_images', hasImages: 'no', totalImages: 0 };
+  }
+  if (status !== 'ok') {
+    return { status: status || 'unknown', hasImages: '', totalImages: '' };
+  }
+  return {
+    status: count > 0 ? 'review_images_found' : 'review_images_collection_empty',
+    hasImages: 'yes',
+    totalImages: count,
+  };
+}
+
+function isBrowserContextClosedError(error) {
+  const text = `${error?.message || ''}\n${error?.stack || ''}`;
+  return /Target page, context or browser has been closed|Target\.createTarget.*Failed to open a new tab|browserContext\.newPage.*closed|Browser closed|Target closed|page has been closed|context has been closed/i.test(text);
+}
+
+function appendRowNote(row, note) {
+  const current = String(row.notes || '').trim();
+  row.notes = current ? `${current}; ${note}` : note;
+}
+
+function markImageCrawlFailure(row, error) {
+  const message = String(error?.message || error || 'unknown error').replace(/\s+/g, ' ').slice(0, 500);
+  row.image_status = 'crawl_failed';
+  row.last_image_crawl_at = nowIso();
+  appendRowNote(row, `image_crawl_error:${row.last_image_crawl_at}:${message}`);
+  return message;
 }
 
 function timestampMs(value) {
@@ -183,8 +226,9 @@ async function readLinesIfExists(file) {
       .split(/\r?\n/)
       .map((line) => line.trim())
       .filter((line) => line && !line.startsWith('#'));
-  } catch {
-    return [];
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return [];
+    throw error;
   }
 }
 
@@ -205,83 +249,6 @@ function clampDiscoverOptions(opts) {
   opts.maxInvalidInspects = Math.max(1, Math.min(12, Number(opts.maxInvalidInspects) || DEFAULTS.maxInvalidInspects));
   opts.maxConsecutiveInvalidInspects = Math.max(1, Math.min(6, Number(opts.maxConsecutiveInvalidInspects) || DEFAULTS.maxConsecutiveInvalidInspects));
   return opts;
-}
-
-function csvEscape(value) {
-  const s = String(value ?? '');
-  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-}
-
-function parseCsvLine(line) {
-  const cells = [];
-  let current = '';
-  let quoted = false;
-  for (let i = 0; i < line.length; i += 1) {
-    const ch = line[i];
-    if (quoted) {
-      if (ch === '"' && line[i + 1] === '"') {
-        current += '"';
-        i += 1;
-      } else if (ch === '"') {
-        quoted = false;
-      } else {
-        current += ch;
-      }
-    } else if (ch === '"') {
-      quoted = true;
-    } else if (ch === ',') {
-      cells.push(current);
-      current = '';
-    } else {
-      current += ch;
-    }
-  }
-  cells.push(current);
-  return cells;
-}
-
-function parseCsvText(raw) {
-  const text = String(raw || '').replace(/^\uFEFF/, '');
-  const lines = text.split(/\r?\n/).filter((line) => line.length);
-  if (!lines.length) return { headers: [], rows: [] };
-  const headers = parseCsvLine(lines[0]);
-  const rows = lines.slice(1).map((line) => {
-    const cells = parseCsvLine(line);
-    const row = {};
-    headers.forEach((header, index) => {
-      row[header] = cells[index] ?? '';
-    });
-    return row;
-  });
-  return { headers, rows };
-}
-
-async function readCsvRows(file, headers = []) {
-  try {
-    const raw = await fs.readFile(file, 'utf8');
-    const parsed = parseCsvText(raw);
-    return parsed.rows.map((row) => {
-      const out = {};
-      headers.forEach((header) => {
-        out[header] = row[header] ?? '';
-      });
-      for (const [key, value] of Object.entries(row)) out[key] = value;
-      return out;
-    });
-  } catch {
-    return [];
-  }
-}
-
-async function writeCsvRows(file, headers, rows) {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  const body = [
-    headers.map(csvEscape).join(','),
-    ...rows.map((row) => headers.map((header) => csvEscape(row[header] ?? '')).join(',')),
-  ].join('\n');
-  const tempFile = `${file}.${process.pid}.tmp`;
-  await fs.writeFile(tempFile, `\uFEFF${body}\n`, 'utf8');
-  await fs.rename(tempFile, file);
 }
 
 async function appendCsv(file, row) {
@@ -453,7 +420,9 @@ async function closeExtraPages(context, keepPages = [], opts = {}) {
 
 async function newManagedPage(context, opts, keepPages = []) {
   const maxOpenPages = Math.max(1, Number(opts.maxOpenPages || DEFAULTS.maxOpenPages));
-  const keep = keepPages.filter((page) => page && !page.isClosed()).slice(-(maxOpenPages - 1));
+  const keepLimit = Math.max(0, maxOpenPages - 1);
+  const availableKeepPages = keepPages.filter((page) => page && !page.isClosed());
+  const keep = keepLimit ? availableKeepPages.slice(-keepLimit) : [];
   const beforePages = context.pages().filter((page) => !page.isClosed());
   const beforeKeep = new Set(keep);
   const reusablePage = beforePages.find((page) => !beforeKeep.has(page));
@@ -530,6 +499,7 @@ async function gotoPage(page, url, opts) {
     await cleanAfterAction(page, opts);
     return !(await isHardBlocked(page));
   } catch (error) {
+    if (isBrowserContextClosedError(error)) throw error;
     console.warn(`    navigation failed: ${error.message}`);
     return false;
   }
@@ -741,7 +711,10 @@ async function extractSellerNameFromPersonalPage(page) {
       return values.find((text) => /来闲鱼|卖出|好评率|分钟前来过|小时前来过|刚刚来过|刚刚擦亮/.test(text)) || values[0] || '';
     })
     .then((values) => (Array.isArray(values) ? values.map(cleanSellerName).find(Boolean) || '' : cleanSellerName(values)))
-    .catch(() => '');
+    .catch((error) => {
+      if (isBrowserContextClosedError(error)) throw error;
+      return '';
+    });
 }
 
 async function clickTextLike(context, page, regexSource, label, opts) {
@@ -791,7 +764,10 @@ async function clickTextLike(context, page, regexSource, label, opts) {
       target.click();
       return first.text.slice(0, 80);
     }, regexSource)
-    .catch(() => '');
+    .catch((error) => {
+      if (isBrowserContextClosedError(error)) throw error;
+      return '';
+    });
   if (!clicked) {
     console.warn(`    click not found: ${label}`);
     return { page, clicked: false };
@@ -985,6 +961,7 @@ async function downloadImageFromCandidates(context, urls, tempPath, opts) {
         contentType: response.headers()['content-type'] || '',
       };
     } catch (error) {
+      if (isBrowserContextClosedError(error)) throw error;
       lastError = `${imageUrl}: ${error.message}`;
     }
   }
@@ -1016,17 +993,18 @@ async function inspectCandidatePage(context, item, keyword, opts) {
       nav = await navigateToImageReviews(context, page, opts);
     }
     const images = nav.status === 'ok' ? await collectReviewImagesByScrolling(nav.page, { ...opts, scrollSteps: Math.min(opts.scrollSteps, 8) }) : [];
+    const inspection = classifyImageInspection(nav.status, images.length);
     const sellerUrl = profile.sellerUrl || (isPersonalPage(nav.reviewUrl || '') ? nav.reviewUrl : '');
     if (!sellerName && sellerUrl) sellerName = await extractSellerNameFromPersonalPage(nav.page || page);
     return {
-      inspectStatus: nav.status,
+      inspectStatus: inspection.status,
       pageTitle,
       finalUrl: page.url(),
       sellerUrl,
       sellerName,
       reviewUrl: nav.reviewUrl || sellerUrl || page.url(),
-      hasImages: images.length > 0 ? 'yes' : 'no',
-      totalImages: images.length,
+      hasImages: inspection.hasImages,
+      totalImages: inspection.totalImages,
     };
   } finally {
     for (const openedPage of context.pages()) {
@@ -1057,17 +1035,17 @@ async function inspectExistingLinkRow(context, row, opts) {
     if (!sellerName && isPersonalPage(sellerUrl || nav.reviewUrl || startUrl)) {
       sellerName = await extractSellerNameFromPersonalPage(nav.page || page);
     }
-    if (nav.status !== 'ok') {
-      return { status: nav.status, sellerUrl, sellerName, reviewUrl: nav.reviewUrl || sellerUrl || startUrl, hasImages: 'no', totalImages: 0 };
-    }
-    const images = await collectReviewImagesByScrolling(nav.page, { ...opts, scrollSteps: Math.min(opts.scrollSteps, 8) });
+    const images = nav.status === 'ok'
+      ? await collectReviewImagesByScrolling(nav.page, { ...opts, scrollSteps: Math.min(opts.scrollSteps, 8) })
+      : [];
+    const inspection = classifyImageInspection(nav.status, images.length);
     return {
-      status: nav.status,
+      status: inspection.status,
       sellerUrl,
       sellerName,
       reviewUrl: nav.reviewUrl || sellerUrl || nav.page.url(),
-      hasImages: images.length ? 'yes' : 'no',
-      totalImages: images.length,
+      hasImages: inspection.hasImages,
+      totalImages: inspection.totalImages,
     };
   } finally {
     for (const openedPage of context.pages()) {
@@ -1183,20 +1161,23 @@ async function discoverLinks(context, keywords, opts, run) {
       row.seller_url = row.seller_url || result.sellerUrl || (isPersonalPage(row.review_url) ? row.review_url : '');
       row.seller_name = cleanSellerName(row.seller_name) || result.sellerName || '';
       row.review_url = result.reviewUrl || row.review_url || row.seller_url || row.item_url;
-      row.has_images = result.hasImages || row.has_images || '';
-      if (result.hasImages) row.total_images = String(result.totalImages || 0);
+      if (result.hasImages) row.has_images = result.hasImages;
+      else if (String(row.has_images || '').trim().toLowerCase() === 'no' && !isConfirmedNoImagesRow(row)) row.has_images = '';
+      if (result.totalImages !== '') row.total_images = String(result.totalImages || 0);
       row.images_downloaded = row.images_downloaded || '0';
       row.images_remaining = row.has_images === 'yes' ? String(Math.max(0, Number(row.total_images || 0) - Number(row.images_downloaded || 0))) : '0';
       row.link_status = result.status || row.link_status;
-      if (row.has_images === 'yes') {
+      if (result.status === 'review_images_collection_empty') {
+        row.image_status = 'collection_empty';
+      } else if (row.has_images === 'yes') {
         const remaining = Number(row.images_remaining || 0);
         const downloaded = Number(row.images_downloaded || 0);
         if (remaining > 0) row.image_status = downloaded > 0 ? 'partial' : 'pending';
         else row.image_status = 'complete';
-      } else if (row.has_images === 'no') {
+      } else if (result.status === 'confirmed_no_images') {
         row.image_status = 'skipped_no_images';
       } else {
-        row.image_status = row.image_status || 'unknown';
+        row.image_status = result.status || row.image_status || 'unknown';
       }
       row.last_link_crawl_at = nowIso();
       byId.set(row.link_id, row);
@@ -1262,7 +1243,13 @@ async function discoverLinks(context, keywords, opts, run) {
           images_downloaded: '0',
           images_remaining: inspection.hasImages === 'yes' ? totalImages : '0',
           link_status: inspection.inspectStatus || 'not_inspected',
-          image_status: inspection.hasImages === 'yes' ? 'pending' : inspection.hasImages === 'no' ? 'skipped_no_images' : 'unknown',
+          image_status: inspection.inspectStatus === 'review_images_collection_empty'
+            ? 'collection_empty'
+            : inspection.hasImages === 'yes'
+              ? 'pending'
+              : inspection.hasImages === 'no'
+                ? 'skipped_no_images'
+                : inspection.inspectStatus || 'unknown',
           last_link_crawl_at: nowIso(),
           last_image_crawl_at: '',
           notes: '',
@@ -1279,7 +1266,7 @@ async function discoverLinks(context, keywords, opts, run) {
       }
     }
   } finally {
-    await searchPage.close().catch(() => {});
+    await releaseManagedPage(context, searchPage, opts);
   }
   await writeCsvRows(linkFile, LINK_STATE_HEADERS, Array.from(byId.values()));
   return { linkFile, batchCsv, summary, written, inspected };
@@ -1365,6 +1352,7 @@ async function downloadImagesForLink(context, linkRow, opts, run, linkRows, imag
     const startUrl = linkRow.seller_url || linkRow.item_url || linkRow.review_url;
     const ok = await gotoPage(page, startUrl, opts);
     if (!ok) {
+      if (String(linkRow.has_images || '').trim().toLowerCase() === 'no' && !isConfirmedNoImagesRow(linkRow)) linkRow.has_images = '';
       linkRow.link_status = 'open_failed_or_blocked';
       linkRow.image_status = 'open_failed_or_blocked';
       linkRow.last_image_crawl_at = nowIso();
@@ -1375,15 +1363,28 @@ async function downloadImagesForLink(context, linkRow, opts, run, linkRows, imag
       : await navigateToImageReviews(context, page, opts);
     linkRow.review_url = nav.reviewUrl || linkRow.review_url || page.url();
     if (nav.status !== 'ok') {
-      linkRow.has_images = 'no';
-      linkRow.link_status = nav.status;
-      linkRow.image_status = nav.status;
+      const inspection = classifyImageInspection(nav.status);
+      if (inspection.hasImages) linkRow.has_images = inspection.hasImages;
+      else if (String(linkRow.has_images || '').trim().toLowerCase() === 'no' && !isConfirmedNoImagesRow(linkRow)) linkRow.has_images = '';
+      if (inspection.totalImages !== '') linkRow.total_images = String(inspection.totalImages);
+      linkRow.link_status = inspection.status;
+      linkRow.image_status = inspection.status === 'confirmed_no_images' ? 'skipped_no_images' : inspection.status;
       linkRow.last_image_crawl_at = nowIso();
-      return { found: 0, downloaded: 0, status: nav.status };
+      return { found: 0, downloaded: 0, status: linkRow.image_status };
     }
     const images = await collectReviewImagesByScrolling(nav.page, opts);
-    linkRow.has_images = images.length ? 'yes' : 'no';
-    linkRow.total_images = String(images.length);
+    const inspection = classifyImageInspection(nav.status, images.length);
+    linkRow.has_images = inspection.hasImages;
+    linkRow.total_images = String(Math.max(Number(linkRow.total_images || 0), inspection.totalImages, savedCount()));
+    if (!images.length) {
+      const downloadedCount = savedCount();
+      linkRow.images_downloaded = String(downloadedCount);
+      linkRow.images_remaining = String(Math.max(0, Number(linkRow.total_images || 0) - downloadedCount));
+      linkRow.image_status = 'collection_empty';
+      linkRow.link_status = inspection.status;
+      linkRow.last_image_crawl_at = nowIso();
+      return { found: 0, downloaded: 0, status: linkRow.image_status };
+    }
     const itemDir = path.resolve(opts.imagesRoot, sanitizeSegment(sellerId));
     await fs.mkdir(itemDir, { recursive: true });
     for (let index = 0; index < images.length; index += 1) {
@@ -1450,6 +1451,7 @@ async function downloadImagesForLink(context, linkRow, opts, run, linkRows, imag
         downloadedThisLink += 1;
         run.imagesDownloaded += 1;
       } catch (error) {
+        if (isBrowserContextClosedError(error)) throw error;
         row.status = 'download_failed';
         row.notes = error.message;
         await fs.unlink(tempPath).catch(() => {});
@@ -1473,9 +1475,9 @@ async function downloadImagesForLink(context, linkRow, opts, run, linkRows, imag
     const downloadedCount = savedCount();
     linkRow.images_downloaded = String(downloadedCount);
     linkRow.images_remaining = String(Math.max(0, Number(linkRow.total_images || images.length) - downloadedCount));
-    linkRow.has_images = images.length ? 'yes' : 'no';
-    linkRow.image_status = images.length && Number(linkRow.images_remaining) <= 0 ? 'complete' : images.length ? 'partial' : 'skipped_no_images';
-    linkRow.link_status = images.length ? 'review_images_found' : 'with_pictures_not_found';
+    linkRow.has_images = 'yes';
+    linkRow.image_status = Number(linkRow.images_remaining) <= 0 ? 'complete' : 'partial';
+    linkRow.link_status = 'review_images_found';
     linkRow.last_image_crawl_at = nowIso();
     syncSellerImageStateToLinks(linkRow, linkRows, imageRows);
     return { found: images.length, downloaded: downloadedThisLink, status: linkRow.image_status };
@@ -1484,7 +1486,7 @@ async function downloadImagesForLink(context, linkRow, opts, run, linkRows, imag
   }
 }
 
-async function downloadImages(context, opts, run) {
+async function downloadImages(context, opts, run, dependencies = {}) {
   const linkFile = linkStatePath(opts);
   const imageFile = imageStatePath(opts);
   const linkRows = await readCsvRows(linkFile, LINK_STATE_HEADERS);
@@ -1517,6 +1519,12 @@ async function downloadImages(context, opts, run) {
   }
   const candidates = Array.from(bySeller.values());
   const selected = candidates.slice(0, opts.maxLinksPerRun);
+  const downloadOne = dependencies.downloadImagesForLink || downloadImagesForLink;
+  const recoverContext = dependencies.recoverContext;
+  let activeContext = context;
+  let contextRecoveries = 0;
+  let processedLinks = 0;
+  let failedLinks = 0;
   const batchCsv = path.join(run.runDir, 'image_download_batch.csv');
   await initCsv(batchCsv, ['crawled_at', 'link_id', 'seller_url', 'review_url', 'found', 'downloaded', 'status']);
   if (skippedNoImages) {
@@ -1527,15 +1535,46 @@ async function downloadImages(context, opts, run) {
   if (!selected.length && requestedRows.length) {
     console.log('No links need image download after filtering has_images=yes and incomplete status.');
   }
+  console.log(`TASK_PROGRESS download-images done=0 total=${selected.length}`);
   for (const row of selected) {
-    if (run.imagesDownloaded >= opts.maxImagesPerRun) break;
+    if (run.imagesDownloaded >= opts.maxImagesPerRun) {
+      console.warn(`TASK_LIMIT_REACHED download-images max-images=${opts.maxImagesPerRun} remaining=${selected.length - processedLinks}`);
+      break;
+    }
     console.log(`\n== Download review images: ${row.link_id} ==`);
-    const result = await downloadImagesForLink(context, row, opts, run, linkRows, imageRows);
+    let result;
+    while (!result) {
+      try {
+        result = await downloadOne(activeContext, row, opts, run, linkRows, imageRows);
+      } catch (error) {
+        if (isBrowserContextClosedError(error) && recoverContext) {
+          if (contextRecoveries >= 3) throw error;
+          contextRecoveries += 1;
+          console.warn(`Browser context closed; rebuilding session (${contextRecoveries}/3) before retrying ${row.link_id}.`);
+          activeContext = await recoverContext(error, contextRecoveries);
+          continue;
+        }
+        const message = markImageCrawlFailure(row, error);
+        failedLinks += 1;
+        result = { found: 0, downloaded: 0, status: 'crawl_failed' };
+        console.warn(`Image crawl failed for ${row.link_id}; continuing with the next seller: ${message}`);
+      }
+    }
     await appendCsv(batchCsv, [nowIso(), row.link_id, row.seller_url, row.review_url, result.found, result.downloaded, result.status]);
     await writeCsvRows(linkFile, LINK_STATE_HEADERS, linkRows);
     await writeCsvRows(imageFile, IMAGE_STATE_HEADERS, imageRows);
+    processedLinks += 1;
+    console.log(`TASK_PROGRESS download-images done=${processedLinks} total=${selected.length}`);
   }
-  return { processedLinks: selected.length, skippedNoImages, downloadedImages: run.imagesDownloaded, batchCsv };
+  return {
+    processedLinks,
+    selectedLinks: selected.length,
+    remainingLinks: Math.max(0, selected.length - processedLinks),
+    failedLinks,
+    skippedNoImages,
+    downloadedImages: run.imagesDownloaded,
+    batchCsv,
+  };
 }
 
 async function getContext(chromium, opts) {
@@ -1576,15 +1615,18 @@ async function main() {
   let context = null;
   try {
     const { chromium } = loadPlaywright();
-    const contextResult = await getContext(chromium, opts);
-    browser = contextResult.browser;
-    context = contextResult.context;
-    const ownsContext = contextResult.ownsContext;
-    context.setDefaultTimeout(15000);
-    if (ownsContext) {
-      await sleep(1000);
-      await closeAllOpenPages(context, 'browser pages', 1);
-    }
+    const openContext = async () => {
+      const contextResult = await getContext(chromium, opts);
+      browser = contextResult.browser;
+      context = contextResult.context;
+      context.setDefaultTimeout(15000);
+      if (contextResult.ownsContext) {
+        await sleep(1000);
+        await closeAllOpenPages(context, 'browser pages', 1);
+      }
+      return context;
+    };
+    await openContext();
     console.log(`Mode: ${opts.mode}`);
     console.log(`Run folder: ${runDir}`);
     if (opts.mode === 'discover-links') {
@@ -1612,7 +1654,16 @@ async function main() {
       console.log(`Seller names updated: ${result.updatedSellers}`);
       return;
     }
-    const result = await downloadImages(context, opts, run);
+    const result = await downloadImages(context, opts, run, {
+      recoverContext: async () => {
+        if (context) await context.close().catch(() => {});
+        if (browser) await browser.close().catch(() => {});
+        context = null;
+        browser = null;
+        await sleep(1000);
+        return openContext();
+      },
+    });
     console.log('\nDone.');
     console.log(`Link state: ${linkStatePath(opts)}`);
     console.log(`Image state: ${imageStatePath(opts)}`);
@@ -1640,8 +1691,12 @@ if (require.main === module) {
 } else {
   module.exports = {
     clickTextLike,
+    classifyImageInspection,
     closeExtraPages,
     closeAllOpenPages,
+    downloadImages,
+    hasImagesStatus,
+    isBrowserContextClosedError,
     newManagedPage,
     releaseManagedPage,
   };

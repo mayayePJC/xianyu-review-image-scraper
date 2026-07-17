@@ -90,6 +90,17 @@ async function testNewManagedPageRetriesAfterCreateTargetFailure() {
   assert.equal(oldPage.isClosed(), false, 'kept page should stay open');
 }
 
+async function testOnePageLimitReusesInsteadOfOpeningSecondPage() {
+  const existingPage = new FakePage('existing');
+  const context = new FakeContext([existingPage]);
+
+  const page = await newManagedPage(context, { maxOpenPages: 1, minDelayMs: 0, maxDelayMs: 0 }, [existingPage]);
+
+  assert.equal(page, existingPage, 'the only page should be reused when the limit is one');
+  assert.equal(context.newPageCalls, 0, 'no second page should be opened');
+  assert.equal(context.pages().filter((item) => !item.isClosed()).length, 1);
+}
+
 async function testCloseAllOpenPagesCanKeepReusablePage() {
   const first = new FakePage('first');
   const second = new FakePage('second');
@@ -126,6 +137,7 @@ async function testReleaseManagedPageClosesPageWhenAnotherPageExists() {
 async function main() {
   await testClickKeepsSearchPageWhenNewTabOpens();
   await testNewManagedPageRetriesAfterCreateTargetFailure();
+  await testOnePageLimitReusesInsteadOfOpeningSecondPage();
   await testCloseAllOpenPagesCanKeepReusablePage();
   await testReleaseManagedPageKeepsLastPageAlive();
   await testReleaseManagedPageClosesPageWhenAnotherPageExists();

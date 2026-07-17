@@ -7,7 +7,7 @@ cd /d "%~dp0"
 set "PYTHONDONTWRITEBYTECODE=1"
 set "PYTHONPYCACHEPREFIX=%~dp0_internal\tmp_pycache"
 
-set "PYTHON_EXE=C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
+set "PYTHON_EXE=%USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
 if not exist "%PYTHON_EXE%" (
   set "PYTHON_EXE=python"
 )
